@@ -439,6 +439,24 @@ class ZImagePipeline(nn.Module):
         """
         prompt = req.prompt
         negative_prompt = req.negative_prompt
+
+        def _has_embeds(value: object) -> bool:
+            if value is None:
+                return False
+            if isinstance(value, torch.Tensor):
+                return value.numel() > 0
+            return len(value) > 0  # type: ignore[arg-type]
+
+        # Prefer embeds provided via the request object (OmniDiffusionRequest),
+        # but don't override explicit kwargs.
+        if prompt_embeds is None:
+            req_prompt_embeds = getattr(req, "prompt_embeds", None)
+            if _has_embeds(req_prompt_embeds):
+                prompt_embeds = req_prompt_embeds
+        if negative_prompt_embeds is None:
+            req_negative_prompt_embeds = getattr(req, "negative_prompt_embeds", None)
+            if _has_embeds(req_negative_prompt_embeds):
+                negative_prompt_embeds = req_negative_prompt_embeds
         height: int = req.height or 1024
         width: int = req.width or 1024
         num_inference_steps = req.num_inference_steps or 50
@@ -475,14 +493,7 @@ class ZImagePipeline(nn.Module):
         else:
             batch_size = len(prompt_embeds)
 
-        # If prompt_embeds is provided and prompt is None, skip encoding
-        if prompt_embeds is not None and prompt is None:
-            if self.do_classifier_free_guidance and negative_prompt_embeds is None:
-                raise ValueError(
-                    "When `prompt_embeds` is provided without `prompt`, "
-                    "`negative_prompt_embeds` must also be provided for classifier-free guidance."
-                )
-        else:
+        if prompt_embeds is None:
             (
                 prompt_embeds,
                 negative_prompt_embeds,
@@ -495,6 +506,13 @@ class ZImagePipeline(nn.Module):
                 device=device,
                 max_sequence_length=max_sequence_length,
             )
+        else:
+            # Respect provided prompt embeddings even if req.prompt is present.
+            if self.do_classifier_free_guidance and not _has_embeds(negative_prompt_embeds):
+                raise ValueError(
+                    "When `prompt_embeds` is provided, `negative_prompt_embeds` must also be provided for "
+                    "classifier-free guidance."
+                )
 
         if isinstance(prompt_embeds, torch.Tensor):
             prompt_embeds = [prompt_embeds]
@@ -638,8 +656,14 @@ class ZImagePipeline(nn.Module):
             image = latents
         else:
             latents = latents.to(self.vae.dtype)
-            scaling_factor = float(getattr(self.vae.config, "scaling_factor", 1.0))
-            shift_factor = float(getattr(self.vae.config, "shift_factor", 0.0))
+            scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
+            if scaling_factor is None:
+                scaling_factor = 1.0
+            shift_factor = getattr(self.vae.config, "shift_factor", 0.0)
+            if shift_factor is None:
+                shift_factor = 0.0
+            scaling_factor = float(scaling_factor)
+            shift_factor = float(shift_factor)
             latents = (latents / scaling_factor) + shift_factor
 
             image = self.vae.decode(latents, return_dict=False)[0]
