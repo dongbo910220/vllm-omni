@@ -163,22 +163,48 @@ class ZImagePipeline(nn.Module):
         self._execution_device = get_local_device()
         model = od_config.model
         local_files_only = os.path.exists(model)
+        self._model = model
+        self._local_files_only = local_files_only
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
-        )
-
-        self.text_encoder = AutoModel.from_pretrained(
-            model, subfolder="text_encoder", local_files_only=local_files_only
         )
         self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self._execution_device
         )
-        self.transformer = ZImageTransformer2DModel()
-        self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
+        self._text_encoder: nn.Module | None = None
+        self._tokenizer = None
+
+        transformer_cfg_path = os.path.join(model, "transformer", "config.json")
+        transformer_kwargs: dict[str, Any] = {}
+        if os.path.exists(transformer_cfg_path):
+            with open(transformer_cfg_path, encoding="utf-8") as f:
+                transformer_cfg = json.load(f)
+            if isinstance(transformer_cfg, dict):
+                transformer_cfg = {k: v for k, v in transformer_cfg.items() if not str(k).startswith("_")}
+                allowed = set(inspect.signature(ZImageTransformer2DModel.__init__).parameters.keys()) - {"self"}
+                transformer_kwargs = {k: v for k, v in transformer_cfg.items() if k in allowed}
+
+        self.transformer = ZImageTransformer2DModel(**transformer_kwargs)
 
         self.vae_scale_factor = (
             2 ** (len(self.vae.config.block_out_channels) - 1) if hasattr(self, "vae") and self.vae is not None else 8
         )
+
+    @property
+    def tokenizer(self):
+        if self._tokenizer is None:
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self._model, subfolder="tokenizer", local_files_only=self._local_files_only
+            )
+        return self._tokenizer
+
+    @property
+    def text_encoder(self) -> nn.Module:
+        if self._text_encoder is None:
+            self._text_encoder = AutoModel.from_pretrained(
+                self._model, subfolder="text_encoder", local_files_only=self._local_files_only
+            ).to(self._execution_device)
+        return self._text_encoder
 
     def encode_prompt(
         self,
@@ -470,6 +496,15 @@ class ZImagePipeline(nn.Module):
                 max_sequence_length=max_sequence_length,
             )
 
+        if isinstance(prompt_embeds, torch.Tensor):
+            prompt_embeds = [prompt_embeds]
+        prompt_embeds = [pe.to(device) for pe in prompt_embeds]
+
+        if isinstance(negative_prompt_embeds, torch.Tensor):
+            negative_prompt_embeds = [negative_prompt_embeds]
+        if negative_prompt_embeds is not None:
+            negative_prompt_embeds = [npe.to(device) for npe in negative_prompt_embeds]
+
         # 4. Prepare latent variables
         num_channels_latents = self.transformer.in_channels
 
@@ -603,7 +638,9 @@ class ZImagePipeline(nn.Module):
             image = latents
         else:
             latents = latents.to(self.vae.dtype)
-            latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+            scaling_factor = float(getattr(self.vae.config, "scaling_factor", 1.0))
+            shift_factor = float(getattr(self.vae.config, "shift_factor", 0.0))
+            latents = (latents / scaling_factor) + shift_factor
 
             image = self.vae.decode(latents, return_dict=False)[0]
             # image = self.image_processor.postprocess(image, output_type=output_type)
