@@ -71,13 +71,14 @@ def test_sd3_extractor_returns_valid_context() -> None:
     pooled_projections = torch.zeros((1, 3))
     timestep = torch.tensor([1])
 
+    # return_dict=True: output is a Transformer2DModelOutput and supports output[0]
     ctx = extractor(
         module,
         hidden_states=hidden_states,
         encoder_hidden_states=encoder_hidden_states,
         pooled_projections=pooled_projections,
         timestep=timestep,
-        return_dict=False,
+        return_dict=True,
     )
     assert isinstance(ctx, CacheContext)
     ctx.validate()
@@ -87,3 +88,20 @@ def test_sd3_extractor_returns_valid_context() -> None:
 
     assert hasattr(output, "sample")
     assert output.sample.shape == (1, 4, 4, 4)
+    assert output[0].shape == (1, 4, 4, 4)
+
+    # return_dict=False: output is a 1-tuple and supports output[0] (pipeline-style)
+    ctx = extractor(
+        module,
+        hidden_states=hidden_states,
+        encoder_hidden_states=encoder_hidden_states,
+        pooled_projections=pooled_projections,
+        timestep=timestep,
+        return_dict=False,
+    )
+    (token_states,) = ctx.run_transformer_blocks()
+    output = ctx.postprocess(token_states)
+
+    assert isinstance(output, tuple)
+    assert len(output) == 1
+    assert output[0].shape == (1, 4, 4, 4)

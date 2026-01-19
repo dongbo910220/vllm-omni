@@ -85,6 +85,13 @@ Start with the default `rel_l1_thresh=0.2` and adjust based on your needs:
 - **Balanced**: Use `0.2-0.4` (recommended)
 - **Maximum speed**: Use `0.6-0.8` (may reduce quality)
 
+### SD3.5 Notes
+
+For `StableDiffusion3Pipeline` (SD3.5), vLLM-Omni uses a **more conservative default polynomial rescaling**
+(`SD3Transformer2DModel` coefficients: `[0, 0, 0, 4, 0]`). This makes `rel_l1_thresh=0.2` less aggressive than it
+would be with identity rescaling (or compared to some other architectures). If you override `coefficients`, re-tune
+`rel_l1_thresh` accordingly.
+
 ## Troubleshooting
 
 ### Quality Degradation

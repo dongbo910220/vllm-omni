@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
 from vllm_omni.diffusion.cache.teacache.extractors import get_extractor
@@ -25,6 +26,8 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
 )
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook, StateManager
+
+logger = init_logger(__name__)
 
 
 class TeaCacheHook(ModelHook):
@@ -64,6 +67,7 @@ class TeaCacheHook(ModelHook):
         self.state_manager = StateManager(TeaCacheState)
         self.extractor_fn = None
         self._forward_cnt = 0
+        self._warned_missing_do_true_cfg = False
 
     def initialize_hook(self, module: torch.nn.Module) -> torch.nn.Module:
         """
@@ -122,7 +126,24 @@ class TeaCacheHook(ModelHook):
         #   - cfg_rank 0: positive branch
         #   - cfg_rank > 0: negative branch
         # Without CFG-parallel, branches alternate within a single rank
-        if module.do_true_cfg:
+        _sentinel = object()
+        do_true_cfg = getattr(module, "do_true_cfg", _sentinel)
+        if do_true_cfg is _sentinel:
+            if not self._warned_missing_do_true_cfg:
+                logger.warning(
+                    "TeaCacheHook: transformer %s missing attribute do_true_cfg; assuming False. "
+                    "If you use classifier-free guidance (CFG), set transformer.do_true_cfg in the pipeline "
+                    "to avoid mixing TeaCache states between CFG branches.",
+                    module.__class__.__name__,
+                )
+                self._warned_missing_do_true_cfg = True
+            do_true_cfg = False
+        elif isinstance(do_true_cfg, torch.Tensor):
+            do_true_cfg = bool(do_true_cfg.item())
+        else:
+            do_true_cfg = bool(do_true_cfg)
+
+        if do_true_cfg:
             cfg_parallel_size = get_classifier_free_guidance_world_size()
             if cfg_parallel_size > 1:
                 cfg_rank = get_classifier_free_guidance_rank()

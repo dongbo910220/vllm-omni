@@ -284,7 +284,6 @@ def extract_sd3_context(
     # ============================================================================
     hidden_states = module.pos_embed(hidden_states)
     temb = module.time_text_embed(timestep, pooled_projections)
-    encoder_hidden_states_proj = module.context_embedder(encoder_hidden_states)
 
     # ============================================================================
     # EXTRACT MODULATED INPUT (for cache decision)
@@ -298,7 +297,9 @@ def extract_sd3_context(
     # ============================================================================
     def run_transformer_blocks():
         h = hidden_states
-        e = encoder_hidden_states_proj
+        # context_embedder can be expensive. Delay it until we actually need to
+        # run transformer blocks (slow-path).
+        e = module.context_embedder(encoder_hidden_states)
         for block in module.transformer_blocks:
             e, h = block(hidden_states=h, encoder_hidden_states=e, temb=temb)
         return (h,)
@@ -320,10 +321,9 @@ def extract_sd3_context(
         h = torch.einsum("nhwpqc->nchpwq", h)
         output = h.reshape(shape=(h.shape[0], out_channels, h_height * patch_size, h_width * patch_size))
 
-        # SD3Transformer2DModel currently always returns Transformer2DModelOutput
-        # (even when return_dict=False); mirror that behavior for consistency.
         _ = kwargs  # reserved for future compatibility
-        _ = return_dict
+        if not return_dict:
+            return (output,)
         return Transformer2DModelOutput(sample=output)
 
     # ============================================================================

@@ -16,6 +16,21 @@ from vllm_omni.utils.platform_utils import detect_device_type, is_npu
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate an image with vLLM-Omni diffusion models.")
+
+    def _parse_teacache_coefficients(value: str) -> list[float]:
+        try:
+            coefficients = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise argparse.ArgumentTypeError(
+                "--teacache_coefficients must be a JSON list, e.g. '[0,0,0,1,0]'"
+            ) from exc
+        if not isinstance(coefficients, list) or len(coefficients) != 5:
+            raise argparse.ArgumentTypeError("--teacache_coefficients must be a JSON list of 5 floats")
+        try:
+            return [float(x) for x in coefficients]
+        except (TypeError, ValueError) as exc:
+            raise argparse.ArgumentTypeError("--teacache_coefficients must be a JSON list of 5 floats") from exc
+
     parser.add_argument(
         "--model",
         default="Qwen/Qwen-Image",
@@ -79,7 +94,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--teacache_coefficients",
-        type=str,
+        type=_parse_teacache_coefficients,
         default=None,
         help=(
             "TeaCache polynomial coefficients as JSON list of 5 floats "
@@ -152,16 +167,7 @@ def main():
         # All parameters marked with [tea_cache only] in DiffusionCacheConfig
         cache_config = {"rel_l1_thresh": args.teacache_rel_l1_thresh}
         if args.teacache_coefficients is not None:
-            try:
-                coefficients = json.loads(args.teacache_coefficients)
-            except json.JSONDecodeError as exc:
-                raise ValueError(
-                    "--teacache_coefficients must be a JSON list, e.g. "
-                    "'[0,0,0,1,0]'"
-                ) from exc
-            if not isinstance(coefficients, list) or len(coefficients) != 5:
-                raise ValueError("--teacache_coefficients must be a JSON list of 5 floats")
-            cache_config["coefficients"] = coefficients
+            cache_config["coefficients"] = args.teacache_coefficients
 
     # assert args.ring_degree == 1, "Ring attention is not supported yet"
     parallel_config = DiffusionParallelConfig(
