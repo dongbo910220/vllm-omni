@@ -127,6 +127,9 @@ class GPUDiffusionModelRunner:
 
         if self.cache_backend is not None:
             self.cache_backend.enable(self.pipeline)
+        # Make the enabled backend visible to the pipeline (optional; some pipelines
+        # gate per-step cache-related bookkeeping on this).
+        setattr(self.pipeline, "_cache_backend", self.cache_backend)
 
         logger.info("Model runner: Initialization complete.")
 

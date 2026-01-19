@@ -104,6 +104,9 @@ class NPUWorker:
 
         if self.cache_backend is not None:
             self.cache_backend.enable(self.pipeline)
+        # Make the enabled backend visible to the pipeline (optional; some pipelines
+        # gate per-step cache-related bookkeeping on this).
+        setattr(self.pipeline, "_cache_backend", self.cache_backend)
 
     def generate(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
         """

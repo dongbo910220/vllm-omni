@@ -188,6 +188,8 @@ class StableDiffusion3Pipeline(
         self.default_sample_size = 128
         self.patch_size = 2
         self.output_type = self.od_config.output_type
+        # Cache backend (set by worker if needed)
+        self._cache_backend = None
 
     def check_inputs(
         self,
@@ -516,8 +518,8 @@ class StableDiffusion3Pipeline(
             timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
 
             # Used by TeaCache hook to separate positive/negative CFG branches.
-            # Keep this attribute present even when do_cfg=False for robustness.
-            self.transformer.do_true_cfg = do_cfg
+            if self._cache_backend is not None:
+                self.transformer.do_true_cfg = do_cfg
 
             transformer_kwargs = {
                 "hidden_states": latents,
