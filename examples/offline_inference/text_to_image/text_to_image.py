@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import json
 import time
 from pathlib import Path
 
@@ -14,12 +15,13 @@ from vllm_omni.utils.platform_utils import detect_device_type, is_npu
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate an image with Qwen-Image.")
+    parser = argparse.ArgumentParser(description="Generate an image with vLLM-Omni diffusion models.")
     parser.add_argument(
         "--model",
         default="Qwen/Qwen-Image",
         help="Diffusion model name or local path. Supported models: "
-        "Qwen/Qwen-Image, Tongyi-MAI/Z-Image-Turbo, Qwen/Qwen-Image-2512",
+        "Qwen/Qwen-Image, Tongyi-MAI/Z-Image-Turbo, Qwen/Qwen-Image-2512, "
+        "stabilityai/stable-diffusion-3.5-medium",
     )
     parser.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
     parser.add_argument(
@@ -67,6 +69,21 @@ def parse_args() -> argparse.Namespace:
             "Cache backend to use for acceleration. "
             "Options: 'cache_dit' (DBCache + SCM + TaylorSeer), 'tea_cache' (Timestep Embedding Aware Cache). "
             "Default: None (no cache acceleration)."
+        ),
+    )
+    parser.add_argument(
+        "--teacache_rel_l1_thresh",
+        type=float,
+        default=0.2,
+        help="TeaCache rel_l1_thresh (only used when --cache_backend tea_cache).",
+    )
+    parser.add_argument(
+        "--teacache_coefficients",
+        type=str,
+        default=None,
+        help=(
+            "TeaCache polynomial coefficients as JSON list of 5 floats "
+            "(only used when --cache_backend tea_cache)."
         ),
     )
     parser.add_argument(
@@ -133,12 +150,18 @@ def main():
     elif args.cache_backend == "tea_cache":
         # TeaCache configuration
         # All parameters marked with [tea_cache only] in DiffusionCacheConfig
-        cache_config = {
-            # TeaCache parameters [tea_cache only]
-            "rel_l1_thresh": 0.2,  # Threshold for accumulated relative L1 distance
-            # Note: coefficients will use model-specific defaults based on model_type
-            #       (e.g., QwenImagePipeline or FluxPipeline)
-        }
+        cache_config = {"rel_l1_thresh": args.teacache_rel_l1_thresh}
+        if args.teacache_coefficients is not None:
+            try:
+                coefficients = json.loads(args.teacache_coefficients)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "--teacache_coefficients must be a JSON list, e.g. "
+                    "'[0,0,0,1,0]'"
+                ) from exc
+            if not isinstance(coefficients, list) or len(coefficients) != 5:
+                raise ValueError("--teacache_coefficients must be a JSON list of 5 floats")
+            cache_config["coefficients"] = coefficients
 
     # assert args.ring_degree == 1, "Ring attention is not supported yet"
     parallel_config = DiffusionParallelConfig(
@@ -164,6 +187,8 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
+    if args.cache_backend == "tea_cache":
+        print(f"  TeaCache rel_l1_thresh: {args.teacache_rel_l1_thresh}")
     print(
         f"  Parallel configuration: tensor_parallel_size={args.tensor_parallel_size}, "
         f"ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}"

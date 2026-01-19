@@ -112,6 +112,7 @@ th {
 | `QwenImageEditPipeline` | Qwen-Image-Edit | `Qwen/Qwen-Image-Edit` |
 | `QwenImageEditPlusPipeline` | Qwen-Image-Edit-2509 | `Qwen/Qwen-Image-Edit-2509` |
 | `QwenImageLayeredPipeline` | Qwen-Image-Layered | `Qwen/Qwen-Image-Layered` |
+| `StableDiffusion3Pipeline` | Stable-Diffusion3.5 | `stabilityai/stable-diffusion-3.5-medium` |
 
 ### VideoGen
 

@@ -1,6 +1,8 @@
 # Text-To-Image
 
-This folder provides several entrypoints for experimenting with `Qwen/Qwen-Image` `Qwen/Qwen-Image-2512` `Tongyi-MAI/Z-Image-Turbo` using vLLM-Omni:
+This folder provides several entrypoints for experimenting with diffusion models such as
+`Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512`, `Tongyi-MAI/Z-Image-Turbo`,
+and `stabilityai/stable-diffusion-3.5-medium` using vLLM-Omni:
 
 - `text_to_image.py`: command-line script for single image generation with advanced options.
 - `web_demo.py`: lightweight Gradio UI for interactive prompt/seed/CFG exploration.
@@ -50,6 +52,22 @@ python text_to_image.py \
   --height 1024 \
   --width 1024 \
   --output outputs/coffee.png
+```
+
+### TeaCache example (SD3.5)
+
+```bash
+python text_to_image.py \
+  --model stabilityai/stable-diffusion-3.5-medium \
+  --prompt "a photo of an orange cat wearing sunglasses" \
+  --seed 42 \
+  --guidance_scale 5.0 \
+  --num_inference_steps 28 \
+  --height 1024 \
+  --width 1024 \
+  --cache_backend tea_cache \
+  --teacache_rel_l1_thresh 0.2 \
+  --output outputs/sd35_teacache.png
 ```
 
 Key arguments:
