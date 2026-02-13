@@ -42,6 +42,16 @@ class DiffusionParallelConfig:
     ring_degree: int = 1
     """Number of GPUs used for ring sequence parallelism."""
 
+    ulysses_mode: str = "strict"
+    """Ulysses sequence-parallel mode.
+
+    - "strict": Require divisibility constraints (fastest, default).
+    - "advanced_uaa": Enable UAA ("Ulysses Anything Attention") to support
+      uneven sequence lengths and non-divisible head counts.
+
+    Note: "advanced_uaa" currently only supports pure Ulysses (ring_degree=1).
+    """
+
     cfg_parallel_size: int = 1
     """Number of Classifier Free Guidance (CFG) parallel groups."""
 
@@ -64,6 +74,15 @@ class DiffusionParallelConfig:
             "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"
             f" but got {self.sequence_parallel_size} != {self.ulysses_degree} * {self.ring_degree}"
         )
+        assert self.ulysses_mode in {"strict", "advanced_uaa"}, (
+            "ulysses_mode must be one of {'strict','advanced_uaa'}, "
+            f"but got {self.ulysses_mode!r}."
+        )
+        if self.ulysses_mode == "advanced_uaa":
+            assert self.ring_degree == 1, (
+                "ulysses_mode='advanced_uaa' currently supports pure Ulysses only; "
+                f"please set ring_degree=1 (got ring_degree={self.ring_degree})."
+            )
         return self
 
     def __post_init__(self) -> None:
