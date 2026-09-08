@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Omni serve command for vLLM-Omni.
 
@@ -7,9 +10,11 @@ diffusion models (e.g., Qwen-Image) through the same CLI interface.
 
 import argparse
 import json
+import math
 import os
 import signal
 from types import FrameType
+from typing import Any, cast
 
 import uvloop
 from vllm.entrypoints.cli.types import CLISubcommand
@@ -19,6 +24,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.cli.logo import log_logo
 from vllm_omni.entrypoints.openai.api_server import omni_run_server
+from vllm_omni.entrypoints.utils import parse_stage_overrides
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 logger = init_logger(__name__)
@@ -41,6 +47,28 @@ Search by using: `--help=<ConfigGroup>` to explore options by section (e.g.,
 --help=OmniConfig)
   Use `--help=all` to show all available flags at once.
 """
+
+
+def _parse_stage_overrides(value: str) -> dict[str, dict[str, Any]]:
+    """Adapt shared stage-override validation to argparse's error type."""
+    try:
+        parsed = parse_stage_overrides(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    if parsed is None:
+        raise argparse.ArgumentTypeError("--stage-overrides requires a JSON object")
+    return parsed
+
+
+def _nonneg_finite_float(value: str) -> float:
+    """Argparse type for finite, non-negative floats (rejects nan/inf)."""
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid float value: {value!r}") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError(f"must be a finite non-negative number, got {value!r}")
+    return parsed
 
 
 def _ensure_vllm_platform():
@@ -152,6 +180,13 @@ class OmniServeCommand(CLISubcommand):
                     "(single-runtime) or `--omni-dp-size-local` (headless / multi-runtime)."
                 )
 
+        lora_backend = getattr(args, "lora_backend", None)
+        lora_path = getattr(args, "lora_path", None)
+        if lora_backend == "distill" and not lora_path:
+            raise ValueError("--lora-backend distill requires --lora-path")
+        if (lora_backend or "peft") == "peft" and isinstance(lora_path, list) and len(lora_path) > 1:
+            raise ValueError("--lora-backend peft accepts only one startup LoRA path")
+
         # --omni-lb-policy is validated against the LoadBalancingPolicy enum.
         omni_lb_policy = getattr(args, "omni_lb_policy", None)
         if omni_lb_policy is not None:
@@ -218,9 +253,8 @@ class OmniServeCommand(CLISubcommand):
             "VoiceDesign, or Base, while diffusion models may use it to select "
             "task-specific weights. If omitted, the model default is used.",
         )
-        # Forced aligner / word timestamps. --forced-aligner is the opt-in
-        # toggle; heavier knobs (gpu_memory_utilization, dtype, max_model_len)
-        # live in the deploy YAML passed via --forced-aligner-config.
+        # Forced aligner / word timestamps. Either flag opts in (--forced-aligner-config
+        # alone works when its YAML sets the model); heavier knobs live in that YAML.
         omni_config_group.add_argument(
             "--forced-aligner",
             type=str,
@@ -242,6 +276,13 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--forced-aligner-device",
+            type=str,
+            default=None,
+            help="Device(s) for the forced-aligner stage (e.g. '2'). Defaults to "
+            "sharing an existing stage's GPU when unset.",
+        )
+        omni_config_group.add_argument(
             "--deploy-config",
             type=str,
             default=None,
@@ -258,7 +299,7 @@ class OmniServeCommand(CLISubcommand):
         )
         omni_config_group.add_argument(
             "--stage-overrides",
-            type=str,
+            type=_parse_stage_overrides,
             default=None,
             help="Per-stage JSON overrides. Example: "
             '\'{"0": {"gpu_memory_utilization": 0.8}, "2": {"enforce_eager": true}}\'',
@@ -416,6 +457,32 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--lora-path",
+            type=str,
+            nargs="+",
+            default=None,
+            help=(
+                "LoRA checkpoint path(s) loaded when the diffusion server starts. "
+                "The distill backend accepts one file per pipeline transformer."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--lora-backend",
+            type=str,
+            choices=["peft", "distill"],
+            default=None,
+            help=(
+                "Diffusion LoRA loading backend. 'distill' fuses checkpoint files "
+                "into the base model at server startup; 'peft' uses the adapter manager."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--lora-scale",
+            type=float,
+            default=None,
+            help="Scale for a startup PEFT LoRA. Distilled LoRAs are fused at their checkpoint scale.",
+        )
+        omni_config_group.add_argument(
             "--diffusion-compile-granularity",
             choices=["regional", "full"],
             default=None,
@@ -487,6 +554,15 @@ class OmniServeCommand(CLISubcommand):
             "'advanced_uaa' enables the experimental UAA path for uneven sequence/head shapes.",
         )
         omni_config_group.add_argument(
+            "--ulysses-a2a-permute",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Enable fused permute-free Ulysses all-to-all over NCCL symmetric memory. "
+                "Only strict Ulysses layouts are eligible. Defaults to disabled."
+            ),
+        )
+        omni_config_group.add_argument(
             "--ring",
             "--ring-degree",
             dest="ring_degree",
@@ -556,6 +632,12 @@ class OmniServeCommand(CLISubcommand):
             "but mutually exclusive with --diffusion-attention-config.default.backend.",
         )
         omni_config_group.add_argument(
+            "--fastvideo-vsa-topk",
+            type=int,
+            default=None,
+            help="Number of key/value blocks selected per query block by FASTVIDEO_VSA.",
+        )
+        omni_config_group.add_argument(
             "--diffusion-attention-config",
             "-dac",
             dest="diffusion_attention_config",
@@ -599,7 +681,7 @@ class OmniServeCommand(CLISubcommand):
         )
         omni_config_group.add_argument(
             "--request-batch-max-wait-ms",
-            type=float,
+            type=_nonneg_finite_float,
             default=0.0,
             help="Request-mode batch admission: max milliseconds to wait for compatible "
             "requests to accumulate before scheduling a fused forward wave. "
@@ -635,29 +717,40 @@ class OmniServeCommand(CLISubcommand):
 
         # diffusion model offload parameters
         omni_config_group.add_argument(
+            "--diffusion-offload-config",
+            type=json.loads,
+            default=None,
+            help="Diffusion CPU-offload config as JSON. "
+            "Set mode to module or layer, list dit and/or text_encoder in "
+            "components, and put layer-only tuning under layer_options. "
+            "Layer settings are weight_transfer (rank-local or allgather) and "
+            "resident_layers (DiT only).",
+        )
+        omni_config_group.add_argument(
             "--enable-cpu-offload",
             action="store_true",
-            help="Enable CPU offloading for diffusion models.",
+            help="Compatibility alias for model-level CPU offload. New integrations should use "
+            "--diffusion-offload-config with mode=module and explicit components.",
         )
         omni_config_group.add_argument(
             "--enable-layerwise-offload",
             action="store_true",
-            help="Enable layerwise (blockwise) offloading on DiT modules.",
+            help="Compatibility alias for layerwise CPU offload. New integrations should use "
+            "--diffusion-offload-config with mode=layer and explicit components.",
         )
         omni_config_group.add_argument(
             "--enable-distributed-layerwise-offload",
             action="store_true",
-            help="Enable distributed layerwise offloading with H2D + AllGather overlap. "
-            "Shards weights across DP ranks, stores only 1/DP_size on each host, "
-            "and overlaps H2D transfers and AllGather with computation. "
-            "DP size is automatically derived from the parallel configuration.",
+            help="Compatibility alias for distributed layerwise CPU offload. "
+            "New integrations should use mode=layer and configure weight transfer per component.",
         )
         omni_config_group.add_argument(
             "--dlo-use-allgather",
             dest="dlo_use_allgather",
             action="store_true",
             default=True,
-            help="Use shard + AllGather for weight reconstruction (default: True). "
+            help="Compatibility option; use component weight_transfer=allgather in new configurations. "
+            "Use shard + AllGather for weight reconstruction (default: True). "
             "When disabled (--dlo-no-use-allgather), each rank streams the "
             "standard loader's rank-local tensors via H2D only — no additional "
             "DP sharding, no AllGather, and no concurrent-request requirement.",
@@ -667,6 +760,7 @@ class OmniServeCommand(CLISubcommand):
             dest="dlo_use_allgather",
             action="store_false",
             help=(
+                "Compatibility option; use component weight_transfer=rank-local in new configurations. "
                 "Disable AllGather and stream standard-loader rank-local weights "
                 "independently (including existing TP shards)."
             ),
@@ -675,8 +769,39 @@ class OmniServeCommand(CLISubcommand):
             "--dlo-resident-layers",
             type=int,
             default=0,
-            help="Keep this many leading main-DiT blocks resident on the device "
-            "while distributed layerwise offload streams the remaining blocks.",
+            help="Compatibility option; use layer_options.dit.resident_layers in new configurations.",
+        )
+        omni_config_group.add_argument(
+            "--host-weight-runtime-mode",
+            choices=("disabled", "preferred", "required"),
+            default="disabled",
+            help=(
+                "Host Weight Runtime policy for eligible no-AllGather DLO: "
+                "disabled does not consult HWR; preferred restores an exact hit "
+                "or canonically loads and publishes on a miss; required restores "
+                "an exact hit or fails startup. Populate a required store with "
+                "preferred first."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--host-weight-runtime-root",
+            type=str,
+            default=None,
+            help=(
+                "Writable node-local Host Weight Runtime store shared by workers "
+                "in one storage domain. Required for preferred and required; use "
+                "the same persistent path for population and serving."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--dlo-host-registration-limit-gib",
+            type=float,
+            default=0.0,
+            help=(
+                "Optional per-worker GiB ceiling for registering an HWR mmap for direct H2D. "
+                "Zero applies no additional ceiling. Eligible no-AllGather HWR hits attempt registration "
+                "under the existing pinned-memory policy and fall back to bounded staging when unavailable."
+            ),
         )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
@@ -729,10 +854,9 @@ class OmniServeCommand(CLISubcommand):
         omni_config_group.add_argument(
             "--text-encoder-tp-size",
             type=int,
-            default=1,
+            default=None,
             help="Tensor-parallel degree for the diffusion text encoder. "
-            "Shards the Qwen3-VL encoder across the first N DiT ranks, "
-            "removing the rank-0 encoder memory hotspot in no-offload runs. "
+            "Shards the encoder across the first N DiT ranks. "
             "Equivalent to setting DiffusionParallelConfig.text_encoder_tp_size.",
         )
         omni_config_group.add_argument(
@@ -772,13 +896,12 @@ class OmniServeCommand(CLISubcommand):
             default=False,
             help="Enable chunked streaming output for diffusion (mainly video generation) models that support it.",
         )
-
         # TTS-specific parameters
         omni_config_group.add_argument(
             "--tts-max-instructions-length",
             type=int,
             default=None,
-            help="Maximum length for TTS voice style instructions (overrides stage config, default: 500).",
+            help="Maximum length for TTS voice style instructions (overrides the pipeline default, default: 500).",
         )
 
         # Disable safety guardrails for this server (currently only applicable for Cosmos3)
@@ -835,6 +958,7 @@ def run_headless(args: TrackingNamespace) -> None:
     from vllm.v1.executor.multiproc_executor import MultiprocExecutor
     from vllm.version import __version__ as VLLM_VERSION
 
+    from vllm_omni.config.resolver import resolve_omni_config
     from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_omni_kv_config_for_stage
     from vllm_omni.engine.stage_engine_startup import (
         get_headless_replica_devices,
@@ -848,10 +972,6 @@ def run_headless(args: TrackingNamespace) -> None:
         inject_omni_kv_connector_config,
         load_omni_transfer_config_for_model,
         prepare_engine_environment,
-    )
-    from vllm_omni.entrypoints.utils import (
-        load_and_resolve_stage_configs,
-        parse_stage_overrides,
     )
 
     model = args.model
@@ -873,6 +993,13 @@ def run_headless(args: TrackingNamespace) -> None:
 
     # Filter down to a dict of things explicitly requested by the user
     args_dict = args.get_explicit_kwargs_dict()
+    # This CLI-only negative alias is consumed below when selecting the
+    # launcher log_stats value; it is not a per-stage config override.
+    args_dict.pop("disable_log_stats", None)
+
+    deploy_config_path = args_dict.pop("deploy_config", None)
+    strategy_config_path = args_dict.pop("strategy_config", None)
+    stage_overrides = args_dict.pop("stage_overrides", None)
 
     # ``--replica-id`` is deprecated and ignored — replica ids are
     # auto-assigned by ``OmniMasterServer`` so headless processes carry
@@ -886,35 +1013,27 @@ def run_headless(args: TrackingNamespace) -> None:
             "master server.",
             args.replica_id,
         )
+        args_dict.pop("replica_id")
 
-    # Parse --stage-overrides (raw JSON string) exactly like the standard
-    # engine path (AsyncOmniEngine._resolve_stage_configs) so headless and
-    # standard launches resolve to the same per-stage device layout.
-    stage_overrides = parse_stage_overrides(args_dict.get("stage_overrides"))
-
-    config_path, stage_configs, _ = load_and_resolve_stage_configs(
+    resolved = resolve_omni_config(
         model,
-        # The serve CLI no longer accepts legacy stage_args YAMLs.
-        None,
-        args_dict,
         # store_true cannot express an explicit False: absent maps to None
         # ("not specified") so the deploy yaml's per-stage value applies.
         trust_remote_code=getattr(args, "trust_remote_code", None) or None,
-        deploy_config_path=args_dict.get("deploy_config"),
+        cli_overrides=args_dict,
+        deploy_config_path=deploy_config_path,
         stage_overrides=stage_overrides,
-        strategy_config_path=args_dict.get("strategy_config"),
+        strategy_config_path=strategy_config_path,
     )
+    config_path = resolved.config_path
+    stage_configs = list(resolved.stage_configs)
 
-    # Locate the stage config that matches stage_id.
-    stage_cfg = None
-    for cfg in stage_configs:
-        if cfg.stage_id == stage_id:
-            stage_cfg = cfg
-            break
-    if stage_cfg is None:
+    try:
+        stage_cfg = resolved.stage_by_id(stage_id)
+    except KeyError:
         raise ValueError(
             f"No stage config found for stage_id={stage_id}. Available stage ids: {[c.stage_id for c in stage_configs]}"
-        )
+        ) from None
 
     prepare_engine_environment()
     per_replica_devices = get_headless_replica_devices(stage_cfg, stage_id, omni_dp_size_local)
@@ -929,7 +1048,7 @@ def run_headless(args: TrackingNamespace) -> None:
             omni_master_port=omni_master_port,
             omni_dp_size_local=omni_dp_size_local,
             per_replica_devices=per_replica_devices,
-            config_path=config_path,
+            config_path=cast(str, config_path),
             replica_bind_address=omni_replica_address,
         )
         return
