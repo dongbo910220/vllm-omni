@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -73,6 +73,7 @@ def main() -> None:
         initialize_model_parallel,
     )
     from vllm_omni.diffusion.forward_context import set_forward_context
+    from vllm_omni.platforms import current_omni_platform
 
     class _BenchmarkPlatform:
         def __init__(self, *, cuda: bool):
@@ -81,8 +82,8 @@ def main() -> None:
         def is_cuda(self) -> bool:
             return self.cuda
 
-    torch.cuda.set_device(0)
     device = torch.device("cuda:0")
+    current_omni_platform.set_device(device)
     dtype = torch.bfloat16
     vllm_config = VllmConfig(device_config=DeviceConfig(device="cuda"))
 
