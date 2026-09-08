@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -48,6 +48,7 @@ from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.qwen_image.fused_qk_norm_rope import (
     qwen_image_fused_qk_norm_rope,
+    qwen_image_qk_norm_rope_fast_path_supported,
 )
 
 logger = init_logger(__name__)
@@ -640,12 +641,13 @@ class QwenImageCrossAttention(nn.Module):
         txt_key = txt_key.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
         txt_value = txt_value.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
 
-        img_cos = vid_freqs.real.to(img_query.dtype)
-        img_sin = vid_freqs.imag.to(img_query.dtype)
-        txt_cos = txt_freqs.real.to(txt_query.dtype)
-        txt_sin = txt_freqs.imag.to(txt_query.dtype)
+        img_cos = torch.real(vid_freqs).to(img_query.dtype)
+        img_sin = torch.imag(vid_freqs).to(img_query.dtype)
+        txt_cos = torch.real(txt_freqs).to(txt_query.dtype)
+        txt_sin = torch.imag(txt_freqs).to(txt_query.dtype)
 
-        if self.qk_norm:
+        use_fused_qk_norm_rope = not torch.compiler.is_compiling()
+        if self.qk_norm and use_fused_qk_norm_rope and qwen_image_qk_norm_rope_fast_path_supported(img_query, img_cos):
             img_query, img_key = qwen_image_fused_qk_norm_rope(
                 img_query,
                 img_key,
@@ -661,15 +663,21 @@ class QwenImageCrossAttention(nn.Module):
             img_query = self.rope(img_query, img_cos, img_sin)
             img_key = self.rope(img_key, img_cos, img_sin)
 
-        txt_query, txt_key = qwen_image_fused_qk_norm_rope(
-            txt_query,
-            txt_key,
-            self.norm_added_q.weight,
-            self.norm_added_k.weight,
-            txt_cos,
-            txt_sin,
-            self.eps,
-        )
+        if use_fused_qk_norm_rope and qwen_image_qk_norm_rope_fast_path_supported(txt_query, txt_cos):
+            txt_query, txt_key = qwen_image_fused_qk_norm_rope(
+                txt_query,
+                txt_key,
+                self.norm_added_q.weight,
+                self.norm_added_k.weight,
+                txt_cos,
+                txt_sin,
+                self.eps,
+            )
+        else:
+            txt_query = self.norm_added_q(txt_query)
+            txt_key = self.norm_added_k(txt_key)
+            txt_query = self.rope(txt_query, txt_cos, txt_sin)
+            txt_key = self.rope(txt_key, txt_cos, txt_sin)
 
         seq_len_txt = encoder_hidden_states.shape[1]
         joint_query = torch.cat([txt_query, img_query], dim=1)
