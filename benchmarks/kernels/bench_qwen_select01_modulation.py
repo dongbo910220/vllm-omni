@@ -228,6 +228,7 @@ def _run(args: argparse.Namespace) -> dict[str, object]:
                 ]
             )
         if "fused" in impls:
+
             def fused_first_norm() -> object:
                 return fused_layernorm_select01(
                     tensors["x"],
