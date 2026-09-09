@@ -21,6 +21,8 @@ from torch.library import Library
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
+from vllm_omni.diffusion.layers.rope import apply_rotary_emb_torch
+
 try:
     from vllm.utils import direct_register_custom_op
 except ImportError:
@@ -41,28 +43,6 @@ def _prepare_qwen_image_cos_sin(
     return cos.to(dtype), sin.to(dtype)
 
 
-def _apply_interleaved_rope(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> torch.Tensor:
-    rotary_dim = cos.shape[-1] * 2
-    x_rot = x[..., :rotary_dim]
-    x_tail = x[..., rotary_dim:]
-    x_even = x_rot[..., ::2]
-    x_odd = x_rot[..., 1::2]
-    cos = cos[None, :, None, :]
-    sin = sin[None, :, None, :]
-    x_rotated = torch.stack(
-        (
-            x_even * cos - x_odd * sin,
-            x_odd * cos + x_even * sin,
-        ),
-        dim=-1,
-    ).flatten(-2)
-    return torch.cat((x_rotated, x_tail), dim=-1)
-
-
 def _eager_qwen_image_qk_norm_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -76,8 +56,8 @@ def _eager_qwen_image_qk_norm_rope(
     q_norm = F.rms_norm(q, (head_dim,), q_weight, eps)
     k_norm = F.rms_norm(k, (head_dim,), k_weight, eps)
     return (
-        _apply_interleaved_rope(q_norm, cos, sin),
-        _apply_interleaved_rope(k_norm, cos, sin),
+        apply_rotary_emb_torch(q_norm, cos, sin, interleaved=True),
+        apply_rotary_emb_torch(k_norm, cos, sin, interleaved=True),
     )
 
 
@@ -126,29 +106,29 @@ if HAS_TRITON:
         k_weight_ptr,
         cos_ptr,
         sin_ptr,
-        q_stride_b: tl.constexpr,
-        q_stride_s: tl.constexpr,
-        q_stride_h: tl.constexpr,
-        q_stride_d: tl.constexpr,
-        k_stride_b: tl.constexpr,
-        k_stride_s: tl.constexpr,
-        k_stride_h: tl.constexpr,
-        k_stride_d: tl.constexpr,
-        q_out_stride_b: tl.constexpr,
-        q_out_stride_s: tl.constexpr,
-        q_out_stride_h: tl.constexpr,
-        q_out_stride_d: tl.constexpr,
-        k_out_stride_b: tl.constexpr,
-        k_out_stride_s: tl.constexpr,
-        k_out_stride_h: tl.constexpr,
-        k_out_stride_d: tl.constexpr,
-        cos_stride_s: tl.constexpr,
-        cos_stride_d: tl.constexpr,
-        sin_stride_s: tl.constexpr,
-        sin_stride_d: tl.constexpr,
+        q_stride_b,
+        q_stride_s,
+        q_stride_h,
+        q_stride_d,
+        k_stride_b,
+        k_stride_s,
+        k_stride_h,
+        k_stride_d,
+        q_out_stride_b,
+        q_out_stride_s,
+        q_out_stride_h,
+        q_out_stride_d,
+        k_out_stride_b,
+        k_out_stride_s,
+        k_out_stride_h,
+        k_out_stride_d,
+        cos_stride_s,
+        cos_stride_d,
+        sin_stride_s,
+        sin_stride_d,
         num_q_heads: tl.constexpr,
         head_dim: tl.constexpr,
-        eps: tl.constexpr,
+        eps,
         input_dtype: tl.constexpr,
         head_block: tl.constexpr,
     ):
