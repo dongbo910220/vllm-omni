@@ -9,12 +9,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vllm_omni.diffusion.layers.rope import RotaryEmbedding
-from vllm_omni.diffusion.models.qwen_image.fused_qk_norm_rope import (
-    qwen_image_fused_qk_norm_rope,
-    qwen_image_fused_qk_norm_rope_fast_path,
-    qwen_image_qk_norm_rope_fast_path_supported,
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    _launch_fused_qk_norm_rope_interleaved,
+    fused_qk_norm_rope_interleaved,
+    fused_qk_norm_rope_interleaved_supported,
 )
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cuda]
 
@@ -121,7 +121,7 @@ def test_qwen_image_fused_qk_norm_rope_cpu_fp32_fallback_matches_reference():
     data = _make_input(seq_len=7, dtype=torch.float32, device=torch.device("cpu"), packed_qkv_view=True)
 
     ref_q, ref_k = _reference_qwen_image_qk_norm_rope(data.q, data.k, data.q_weight, data.k_weight, data.cos, data.sin)
-    out_q, out_k = qwen_image_fused_qk_norm_rope(data.q, data.k, data.q_weight, data.k_weight, data.cos, data.sin, EPS)
+    out_q, out_k = fused_qk_norm_rope_interleaved(data.q, data.k, data.q_weight, data.k_weight, data.cos, data.sin, EPS)
 
     torch.testing.assert_close(out_q, ref_q, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(out_k, ref_k, atol=1e-5, rtol=1e-5)
@@ -131,7 +131,7 @@ def test_qwen_image_qk_norm_rope_fast_path_support_rejects_cpu():
     q = torch.empty(1, 1024, Q_HEADS, HEAD_DIM, dtype=torch.bfloat16)
     cos = torch.empty(1024, HEAD_DIM // 2, dtype=torch.bfloat16)
 
-    assert not qwen_image_qk_norm_rope_fast_path_supported(q, cos)
+    assert not fused_qk_norm_rope_interleaved_supported(q, q, cos, cos)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -141,8 +141,8 @@ def test_qwen_image_qk_norm_rope_fast_path_support_rejects_empty_sequence():
     min_q = torch.empty(1, 1, Q_HEADS, HEAD_DIM, device="cuda:0", dtype=torch.bfloat16)
     min_cos = torch.empty(1, HEAD_DIM // 2, device="cuda:0", dtype=torch.bfloat16)
 
-    assert not qwen_image_qk_norm_rope_fast_path_supported(empty_q, empty_cos)
-    assert qwen_image_qk_norm_rope_fast_path_supported(min_q, min_cos)
+    assert not fused_qk_norm_rope_interleaved_supported(empty_q, empty_q, empty_cos, empty_cos)
+    assert fused_qk_norm_rope_interleaved_supported(min_q, min_q, min_cos, min_cos)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -161,9 +161,9 @@ def test_qwen_image_fused_qk_norm_rope_cuda_fp32_fallback_matches_reference():
     cos = torch.cos(freqs).to(dtype)
     sin = torch.sin(freqs).to(dtype)
 
-    assert not qwen_image_qk_norm_rope_fast_path_supported(q, cos)
+    assert not fused_qk_norm_rope_interleaved_supported(q, k, cos, sin)
     ref_q, ref_k = _reference_qwen_image_qk_norm_rope(q, k, q_weight, k_weight, cos, sin)
-    out_q, out_k = qwen_image_fused_qk_norm_rope(q, k, q_weight, k_weight, cos, sin, EPS)
+    out_q, out_k = fused_qk_norm_rope_interleaved(q, k, q_weight, k_weight, cos, sin, EPS)
 
     _assert_close_with_error_stats(out_q, ref_q, name="query", atol=1e-5, rtol=1e-5)
     _assert_close_with_error_stats(out_k, ref_k, name="key", atol=1e-5, rtol=1e-5)
@@ -185,9 +185,9 @@ def test_qwen_image_fused_qk_norm_rope_cuda_non_default_head_dim_matches_referen
     cos = torch.cos(freqs).to(dtype)
     sin = torch.sin(freqs).to(dtype)
 
-    assert qwen_image_qk_norm_rope_fast_path_supported(q, cos)
+    assert fused_qk_norm_rope_interleaved_supported(q, k, cos, sin)
     ref_q, ref_k = _reference_qwen_image_qk_norm_rope(q, k, q_weight, k_weight, cos, sin)
-    out_q, out_k = qwen_image_fused_qk_norm_rope(q, k, q_weight, k_weight, cos, sin, EPS)
+    out_q, out_k = fused_qk_norm_rope_interleaved(q, k, q_weight, k_weight, cos, sin, EPS)
 
     _assert_close_with_error_stats(out_q, ref_q, name="query", atol=1e-2, rtol=1e-2)
     _assert_close_with_error_stats(out_k, ref_k, name="key", atol=1e-2, rtol=1e-2)
@@ -218,7 +218,7 @@ def test_qwen_image_fused_qk_norm_rope_cuda_matches_reference(
     )
 
     ref_q, ref_k = _reference_qwen_image_qk_norm_rope(data.q, data.k, data.q_weight, data.k_weight, data.cos, data.sin)
-    out_q, out_k = qwen_image_fused_qk_norm_rope(data.q, data.k, data.q_weight, data.k_weight, data.cos, data.sin, EPS)
+    out_q, out_k = fused_qk_norm_rope_interleaved(data.q, data.k, data.q_weight, data.k_weight, data.cos, data.sin, EPS)
 
     _assert_close_with_error_stats(out_q, ref_q, name="query", atol=atol, rtol=rtol)
     _assert_close_with_error_stats(out_k, ref_k, name="key", atol=atol, rtol=rtol)
@@ -234,7 +234,7 @@ def test_qwen_image_fused_qk_norm_rope_fast_path_matches_reference():
     )
 
     ref_q, ref_k = _reference_qwen_image_qk_norm_rope(data.q, data.k, data.q_weight, data.k_weight, data.cos, data.sin)
-    out_q, out_k = qwen_image_fused_qk_norm_rope_fast_path(
+    out_q, out_k = _launch_fused_qk_norm_rope_interleaved(
         data.q,
         data.k,
         data.q_weight,
@@ -242,6 +242,8 @@ def test_qwen_image_fused_qk_norm_rope_fast_path_matches_reference():
         data.cos,
         data.sin,
         EPS,
+        num_warps=4,
+        num_stages=4,
     )
 
     _assert_close_with_error_stats(out_q, ref_q, name="query", atol=1e-2, rtol=1e-2)
@@ -258,9 +260,9 @@ def test_qwen_image_fused_qk_norm_rope_4096_image_seq_matches_reference():
         batch=1,
     )
 
-    assert qwen_image_qk_norm_rope_fast_path_supported(data.q, data.cos)
+    assert fused_qk_norm_rope_interleaved_supported(data.q, data.k, data.cos, data.sin)
     ref_q, ref_k = _reference_qwen_image_qk_norm_rope(data.q, data.k, data.q_weight, data.k_weight, data.cos, data.sin)
-    out_q, out_k = qwen_image_fused_qk_norm_rope_fast_path(
+    out_q, out_k = _launch_fused_qk_norm_rope_interleaved(
         data.q,
         data.k,
         data.q_weight,
@@ -268,6 +270,8 @@ def test_qwen_image_fused_qk_norm_rope_4096_image_seq_matches_reference():
         data.cos,
         data.sin,
         EPS,
+        num_warps=4,
+        num_stages=4,
     )
 
     _assert_close_with_error_stats(out_q, ref_q, name="query", atol=1e-2, rtol=1e-2)
@@ -291,7 +295,7 @@ def test_qwen_image_fused_qk_norm_rope_torch_compile_fullgraph_capture():
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return qwen_image_fused_qk_norm_rope(q, k, q_weight, k_weight, cos, sin, EPS)
+        return fused_qk_norm_rope_interleaved(q, k, q_weight, k_weight, cos, sin, EPS)
 
     compiled_fn = torch.compile(fn, dynamic=True, fullgraph=True)
     ref_q, ref_k = fn(data.q, data.k, data.q_weight, data.k_weight, data.cos, data.sin)

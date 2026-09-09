@@ -18,12 +18,12 @@ from collections.abc import Callable
 import torch
 import torch.nn.functional as F
 
-from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rotary_emb_torch
-from vllm_omni.diffusion.models.qwen_image.fused_qk_norm_rope import (
-    _qwen_image_fused_qk_norm_rope_triton,
-    qwen_image_fused_qk_norm_rope,
-    qwen_image_qk_norm_rope_fast_path_supported,
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    _launch_fused_qk_norm_rope_interleaved,
+    fused_qk_norm_rope_interleaved,
+    fused_qk_norm_rope_interleaved_supported,
 )
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rotary_emb_torch
 
 
 def _parse_args() -> argparse.Namespace:
@@ -183,7 +183,7 @@ def main() -> None:
         return _eager(q, k, q_weight, k_weight, cos, sin, eps)
 
     def fused():
-        return qwen_image_fused_qk_norm_rope(q, k, q_weight, k_weight, cos, sin, eps)
+        return fused_qk_norm_rope_interleaved(q, k, q_weight, k_weight, cos, sin, eps)
 
     def existing_rope():
         return _existing_rope(q, k, q_weight, k_weight, cos, sin, eps, rope)
@@ -197,7 +197,7 @@ def main() -> None:
         "head_dim": args.head_dim,
         "dtype": args.dtype,
         "packed_qkv_view": args.packed_qkv_view,
-        "fused_fast_path_supported": qwen_image_qk_norm_rope_fast_path_supported(q, cos),
+        "fused_fast_path_supported": fused_qk_norm_rope_interleaved_supported(q, k, cos, sin),
     }
 
     eager_samples = _measure(eager, args.warmup, args.iters)
@@ -233,7 +233,6 @@ def main() -> None:
         results["compiled_eager"] = compiled_stats
         results["compiled_fused"] = compiled_fused_stats
         results["compiled_existing_rope"] = compiled_existing_rope_stats
-        results["speedup_vs_compiled_eager"] = compiled_stats["median_ms"] / fused_stats["median_ms"]
         results["compiled_fused_speedup_vs_compiled_eager"] = (
             compiled_stats["median_ms"] / compiled_fused_stats["median_ms"]
         )
@@ -250,7 +249,7 @@ def main() -> None:
                 num_warps: int = num_warps,
                 num_stages: int = num_stages,
             ):
-                return _qwen_image_fused_qk_norm_rope_triton(
+                return _launch_fused_qk_norm_rope_interleaved(
                     q,
                     k,
                     q_weight,
@@ -258,8 +257,6 @@ def main() -> None:
                     cos,
                     sin,
                     eps,
-                    q.shape[-1],
-                    cos.shape[-1] * 2,
                     num_warps=num_warps,
                     num_stages=num_stages,
                 )

@@ -45,11 +45,11 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
-from vllm_omni.diffusion.layers.rope import RotaryEmbedding
-from vllm_omni.diffusion.models.qwen_image.fused_qk_norm_rope import (
-    qwen_image_fused_qk_norm_rope,
-    qwen_image_qk_norm_rope_fast_path_supported,
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    fused_qk_norm_rope_interleaved,
+    fused_qk_norm_rope_interleaved_supported,
 )
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
 
@@ -647,8 +647,12 @@ class QwenImageCrossAttention(nn.Module):
         txt_sin = torch.imag(txt_freqs).to(txt_query.dtype)
 
         use_fused_qk_norm_rope = not torch.compiler.is_compiling()
-        if self.qk_norm and use_fused_qk_norm_rope and qwen_image_qk_norm_rope_fast_path_supported(img_query, img_cos):
-            img_query, img_key = qwen_image_fused_qk_norm_rope(
+        if (
+            self.qk_norm
+            and use_fused_qk_norm_rope
+            and fused_qk_norm_rope_interleaved_supported(img_query, img_key, img_cos, img_sin)
+        ):
+            img_query, img_key = fused_qk_norm_rope_interleaved(
                 img_query,
                 img_key,
                 self.norm_q.weight,
@@ -663,8 +667,8 @@ class QwenImageCrossAttention(nn.Module):
             img_query = self.rope(img_query, img_cos, img_sin)
             img_key = self.rope(img_key, img_cos, img_sin)
 
-        if use_fused_qk_norm_rope and qwen_image_qk_norm_rope_fast_path_supported(txt_query, txt_cos):
-            txt_query, txt_key = qwen_image_fused_qk_norm_rope(
+        if use_fused_qk_norm_rope and fused_qk_norm_rope_interleaved_supported(txt_query, txt_key, txt_cos, txt_sin):
+            txt_query, txt_key = fused_qk_norm_rope_interleaved(
                 txt_query,
                 txt_key,
                 self.norm_added_q.weight,
