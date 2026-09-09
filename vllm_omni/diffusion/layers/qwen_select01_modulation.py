@@ -5,12 +5,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-
-try:
-    from vllm.triton_utils import tl, triton
-except ImportError:
-    import triton
-    import triton.language as tl
+from vllm.triton_utils import HAS_TRITON, tl, triton
 
 
 @triton.jit
@@ -424,7 +419,7 @@ def fused_layernorm_select01(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     scale0, shift0, gate0, scale1, shift1, gate1 = split_select01_mod_params(mod_params)
     is_compiling = torch.compiler.is_compiling()
-    if x.is_cuda and not is_compiling:
+    if x.is_cuda and HAS_TRITON and not is_compiling:
         return _launch_layernorm_select01(
             x,
             weight,
@@ -462,7 +457,7 @@ def fused_residual_layernorm_select01(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     scale0, shift0, gate0, scale1, shift1, gate1 = split_select01_mod_params(mod_params)
     is_compiling = torch.compiler.is_compiling()
-    if x.is_cuda and not is_compiling:
+    if x.is_cuda and HAS_TRITON and not is_compiling:
         return _launch_residual_layernorm_select01(
             x,
             residual,

@@ -18,7 +18,6 @@ Run on a CUDA machine for actionable numbers, for example:
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import statistics
 import sys
@@ -35,8 +34,10 @@ for candidate in Path(__file__).resolve().parents:
             sys.path.insert(0, str(candidate))
         break
 
-
-_FUSED_FNS: tuple[Callable[..., object], Callable[..., object]] | None = None
+from vllm_omni.diffusion.layers.qwen_select01_modulation import (  # noqa: E402
+    fused_layernorm_select01,
+    fused_residual_layernorm_select01,
+)
 
 
 def _dtype(name: str) -> torch.dtype:
@@ -94,36 +95,6 @@ def _native_residual_layernorm_select01(
     residual_out = residual + residual_gate * x
     out = F.layer_norm(residual_out.float(), (residual_out.shape[-1],), eps=eps).to(residual_out.dtype)
     return out * (1 + scale) + shift, residual_out, gate
-
-
-def _load_fused_fns() -> tuple[Callable[..., object], Callable[..., object]]:
-    global _FUSED_FNS
-    if _FUSED_FNS is None:
-        module_paths = [
-            *(
-                candidate / "vllm_omni/diffusion/layers/qwen_select01_modulation.py"
-                for candidate in Path(__file__).resolve().parents
-            ),
-            Path(__file__).with_name("qwen_select01_modulation.py"),
-        ]
-        module_path = next((path for path in module_paths if path.exists()), None)
-        if module_path is None:
-            from vllm_omni.diffusion.layers.qwen_select01_modulation import (
-                fused_layernorm_select01,
-                fused_residual_layernorm_select01,
-            )
-        else:
-            spec = importlib.util.spec_from_file_location("qwen_select01_modulation", module_path)
-            if spec is None or spec.loader is None:
-                raise ImportError(f"Cannot load fused module from {module_path}")
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[spec.name] = module
-            spec.loader.exec_module(module)
-            fused_layernorm_select01 = module.fused_layernorm_select01
-            fused_residual_layernorm_select01 = module.fused_residual_layernorm_select01
-
-        _FUSED_FNS = (fused_layernorm_select01, fused_residual_layernorm_select01)
-    return _FUSED_FNS
 
 
 def _time_cuda(fn: Callable[[], object], warmup: int, iters: int) -> list[float]:
@@ -257,8 +228,6 @@ def _run(args: argparse.Namespace) -> dict[str, object]:
                 ]
             )
         if "fused" in impls:
-            fused_layernorm_select01, fused_residual_layernorm_select01 = _load_fused_fns()
-
             def fused_first_norm() -> object:
                 return fused_layernorm_select01(
                     tensors["x"],
@@ -285,7 +254,6 @@ def _run(args: argparse.Namespace) -> dict[str, object]:
             )
 
         if args.check and "fused" in impls:
-            fused_layernorm_select01, fused_residual_layernorm_select01 = _load_fused_fns()
             ref_norm, ref_gate = first_norm()
             actual_norm, actual_gate = fused_layernorm_select01(
                 tensors["x"],

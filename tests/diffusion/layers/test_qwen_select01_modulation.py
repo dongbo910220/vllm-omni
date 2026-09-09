@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from vllm_omni.diffusion.layers import qwen_select01_modulation
 from vllm_omni.diffusion.layers.qwen_select01_modulation import (
     fused_layernorm_select01,
     fused_residual_layernorm_select01,
@@ -180,4 +181,44 @@ def test_qwen_select01_triton_matches_reference_for_structured_multi_batch_index
     )
     torch.testing.assert_close(actual_norm, ref_norm, atol=atol, rtol=rtol)
     torch.testing.assert_close(actual_residual, ref_residual, atol=atol, rtol=rtol)
+    torch.testing.assert_close(actual_gate, ref_gate, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_qwen_select01_cuda_falls_back_without_triton(monkeypatch):
+    device = torch.device("cuda:0")
+    x, residual, residual_gate, mod_params, index = _make_inputs(2, 7, 256, torch.bfloat16, device)
+    residual_gate = residual_gate.expand_as(residual)
+    eps = 1e-6
+
+    def fail_if_launched(*args, **kwargs):
+        pytest.fail("Triton launcher must not run when HAS_TRITON is false")
+
+    monkeypatch.setattr(qwen_select01_modulation, "HAS_TRITON", False)
+    monkeypatch.setattr(qwen_select01_modulation, "_launch_layernorm_select01", fail_if_launched)
+    monkeypatch.setattr(qwen_select01_modulation, "_launch_residual_layernorm_select01", fail_if_launched)
+
+    actual_norm, actual_gate = fused_layernorm_select01(x, mod_params, index, eps)
+    ref_norm, ref_gate = _reference_layernorm_select01(x, mod_params, index, eps)
+    torch.testing.assert_close(actual_norm, ref_norm, atol=0, rtol=0)
+    torch.testing.assert_close(actual_gate, ref_gate, atol=0, rtol=0)
+
+    actual_norm, actual_residual, actual_gate = fused_residual_layernorm_select01(
+        x,
+        residual,
+        residual_gate,
+        mod_params,
+        index,
+        eps,
+    )
+    ref_norm, ref_residual, ref_gate = _reference_residual_layernorm_select01(
+        x,
+        residual,
+        residual_gate,
+        mod_params,
+        index,
+        eps,
+    )
+    torch.testing.assert_close(actual_norm, ref_norm, atol=0, rtol=0)
+    torch.testing.assert_close(actual_residual, ref_residual, atol=0, rtol=0)
     torch.testing.assert_close(actual_gate, ref_gate, atol=0, rtol=0)
