@@ -46,8 +46,10 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.qwen_select01_modulation import (
+    can_use_qwen_select01_triton,
     fused_layernorm_select01,
     fused_residual_layernorm_select01,
+    select01_modulation_native,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
@@ -822,7 +824,8 @@ class QwenImageTransformerBlock(nn.Module):
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
 
         # Process image stream - norm1 + modulation
-        if modulate_index is not None:
+        use_fused_select01 = modulate_index is not None and can_use_qwen_select01_triton(hidden_states)
+        if use_fused_select01:
             img_modulated, img_gate1 = fused_layernorm_select01(
                 hidden_states,
                 img_mod1,
@@ -831,6 +834,9 @@ class QwenImageTransformerBlock(nn.Module):
                 self.img_norm1.layernorm.weight,
                 self.img_norm1.layernorm.bias,
             )
+        elif modulate_index is not None:
+            img_scale1, img_shift1, img_gate1 = select01_modulation_native(img_mod1, modulate_index)
+            img_modulated = self.img_norm1(hidden_states, img_scale1, img_shift1)
         else:
             img_scale1, img_shift1, img_gate1 = self._modulate(img_mod1)
             img_modulated = self.img_norm1(hidden_states, img_scale1, img_shift1)
@@ -859,12 +865,12 @@ class QwenImageTransformerBlock(nn.Module):
 
         # Apply attention gates and add residual (like in Megatron)
         hidden_states_before_attn = hidden_states
-        if modulate_index is None:
+        if not use_fused_select01:
             hidden_states = hidden_states + img_gate1 * img_attn_output
         encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
 
         # Process image stream - norm2 + MLP
-        if modulate_index is not None:
+        if use_fused_select01:
             img_modulated2, hidden_states, img_gate2 = fused_residual_layernorm_select01(
                 img_attn_output,
                 hidden_states_before_attn,
@@ -875,6 +881,9 @@ class QwenImageTransformerBlock(nn.Module):
                 self.img_norm2.layernorm.weight,
                 self.img_norm2.layernorm.bias,
             )
+        elif modulate_index is not None:
+            img_scale2, img_shift2, img_gate2 = select01_modulation_native(img_mod2, modulate_index)
+            img_modulated2 = self.img_norm2(hidden_states, img_scale2, img_shift2)
         else:
             img_scale2, img_shift2, img_gate2 = self._modulate(img_mod2)
             img_modulated2 = self.img_norm2(hidden_states, img_scale2, img_shift2)

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
 
@@ -409,6 +410,10 @@ def _launch_residual_layernorm_select01(
     return output, residual_out, gate_out
 
 
+def can_use_qwen_select01_triton(x: torch.Tensor) -> bool:
+    return HAS_TRITON and current_platform.is_cuda() and x.is_cuda
+
+
 def fused_layernorm_select01(
     x: torch.Tensor,
     mod_params: torch.Tensor,
@@ -419,7 +424,7 @@ def fused_layernorm_select01(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     scale0, shift0, gate0, scale1, shift1, gate1 = split_select01_mod_params(mod_params)
     is_compiling = torch.compiler.is_compiling()
-    if x.is_cuda and HAS_TRITON and not is_compiling:
+    if can_use_qwen_select01_triton(x) and not is_compiling:
         return _launch_layernorm_select01(
             x,
             weight,
@@ -457,7 +462,7 @@ def fused_residual_layernorm_select01(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     scale0, shift0, gate0, scale1, shift1, gate1 = split_select01_mod_params(mod_params)
     is_compiling = torch.compiler.is_compiling()
-    if x.is_cuda and HAS_TRITON and not is_compiling:
+    if can_use_qwen_select01_triton(x) and not is_compiling:
         return _launch_residual_layernorm_select01(
             x,
             residual,

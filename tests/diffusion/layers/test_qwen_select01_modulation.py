@@ -9,12 +9,44 @@ import torch.nn.functional as F
 
 from vllm_omni.diffusion.layers import qwen_select01_modulation
 from vllm_omni.diffusion.layers.qwen_select01_modulation import (
+    can_use_qwen_select01_triton,
     fused_layernorm_select01,
     fused_residual_layernorm_select01,
     select01_modulation_native,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("platform_is_cuda", "tensor_is_cuda", "has_triton", "expected"),
+    [
+        (True, True, True, True),
+        (False, True, True, False),
+        (True, False, True, False),
+        (True, True, False, False),
+    ],
+)
+def test_qwen_select01_triton_requires_cuda_platform(
+    monkeypatch,
+    platform_is_cuda: bool,
+    tensor_is_cuda: bool,
+    has_triton: bool,
+    expected: bool,
+):
+    class FakePlatform:
+        @staticmethod
+        def is_cuda() -> bool:
+            return platform_is_cuda
+
+    class FakeTensor:
+        is_cuda = tensor_is_cuda
+
+    monkeypatch.setattr(qwen_select01_modulation, "current_platform", FakePlatform())
+    monkeypatch.setattr(qwen_select01_modulation, "HAS_TRITON", has_triton)
+
+    assert can_use_qwen_select01_triton(FakeTensor()) is expected
 
 
 def _make_inputs(
