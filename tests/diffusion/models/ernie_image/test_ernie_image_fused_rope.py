@@ -131,3 +131,58 @@ def test_compile_path_does_not_launch_fused_kernel(monkeypatch):
     )
     with torch.inference_mode():
         assert fused_rope.try_fused_qk_rotary_emb(query, key, freqs_cos, freqs_sin, _apply_rotary_emb) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+@pytest.mark.parametrize("requires_grad_input", ["query", "key", "cos", "sin"])
+def test_gradient_inputs_do_not_launch_fused_kernel(monkeypatch, requires_grad_input):
+    from vllm_omni.diffusion.models.ernie_image import fused_rope
+
+    values = list(_inputs((1, 17, 3, 128)))
+    input_index = {"query": 0, "key": 1, "cos": 2, "sin": 3}[requires_grad_input]
+    values[input_index].requires_grad_(True)
+
+    def unexpected_launch(*args):
+        raise AssertionError("autograd inputs must remain on the native path")
+
+    monkeypatch.setattr(
+        fused_rope,
+        "_launch_fused_qk_rotary_emb",
+        unexpected_launch,
+    )
+    assert (
+        fused_rope.try_fused_qk_rotary_emb(
+            *values,
+            _apply_rotary_emb,
+        )
+        is None
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+def test_mismatched_key_dtype_or_device_does_not_launch(monkeypatch):
+    from vllm_omni.diffusion.models.ernie_image import fused_rope
+
+    query, key, freqs_cos, freqs_sin = _inputs((1, 17, 3, 128))
+
+    def unexpected_launch(*args):
+        raise AssertionError("mismatched Q/K inputs must remain native")
+
+    monkeypatch.setattr(
+        fused_rope,
+        "_launch_fused_qk_rotary_emb",
+        unexpected_launch,
+    )
+    for unsupported_key in (key.float(), key.cpu()):
+        assert (
+            fused_rope.try_fused_qk_rotary_emb(
+                query,
+                unsupported_key,
+                freqs_cos,
+                freqs_sin,
+                _apply_rotary_emb,
+            )
+            is None
+        )

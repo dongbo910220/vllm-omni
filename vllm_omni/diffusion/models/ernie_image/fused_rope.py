@@ -112,13 +112,13 @@ def _supported_inputs(
 ) -> bool:
     if torch.compiler.is_compiling():
         return False
-    if query.requires_grad or key.requires_grad:
+    if any(tensor.requires_grad for tensor in (query, key, freqs_cos, freqs_sin)):
         return False
     if not HAS_TRITON or not current_omni_platform.is_cuda():
         return False
     if query.dtype is not torch.bfloat16 or not query.is_cuda:
         return False
-    if query.ndim != 4 or key.shape != query.shape:
+    if query.ndim != 4 or key.shape != query.shape or key.dtype is not query.dtype or key.device != query.device:
         return False
     if not query.is_contiguous() or not key.is_contiguous():
         return False
