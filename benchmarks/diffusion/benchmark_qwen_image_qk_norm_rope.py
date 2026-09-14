@@ -19,11 +19,12 @@ import torch
 import torch.nn.functional as F
 
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
-    _launch_fused_qk_norm_rope_interleaved,
-    fused_qk_norm_rope_interleaved,
-    fused_qk_norm_rope_interleaved_supported,
+    _fused_cuda_supported,
+    fused_qk_norm_rope,
 )
-from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rotary_emb_torch
+from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
+    _apply_qwen_image_rotary_emb,
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -38,12 +39,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
     parser.add_argument("--packed-qkv-view", action="store_true")
     parser.add_argument("--include-compiled", action="store_true")
-    parser.add_argument("--launch-config-sweep", action="store_true")
-    parser.add_argument(
-        "--launch-configs",
-        default="2:2,2:3,4:3,4:4",
-        help="Comma-separated Triton launch configs as num_warps:num_stages.",
-    )
     parser.add_argument("--profile", action="store_true")
     return parser.parse_args()
 
@@ -56,32 +51,12 @@ def _dtype(name: str) -> torch.dtype:
     }[name]
 
 
-def _parse_launch_configs(value: str) -> list[tuple[int, int]]:
-    configs = []
-    for item in value.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        try:
-            warps_str, stages_str = item.split(":", maxsplit=1)
-            num_warps = int(warps_str)
-            num_stages = int(stages_str)
-        except ValueError as exc:
-            raise ValueError(f"Invalid launch config {item!r}; expected num_warps:num_stages") from exc
-        if num_warps <= 0 or num_stages <= 0:
-            raise ValueError(f"Launch config values must be positive, got {item!r}")
-        configs.append((num_warps, num_stages))
-    if not configs:
-        raise ValueError("At least one launch config is required")
-    return configs
-
-
 def _make_inputs(args: argparse.Namespace, dtype: torch.dtype, device: torch.device):
     torch.manual_seed(2026)
     if args.packed_qkv_view:
         qkv_dim = (args.heads + args.kv_heads + args.kv_heads) * args.head_dim
         qkv = torch.randn(args.batch, args.seq_len, qkv_dim, device=device, dtype=dtype)
-        q, k, _v = qkv.split(
+        q, k, _ = qkv.split(
             [
                 args.heads * args.head_dim,
                 args.kv_heads * args.head_dim,
@@ -95,44 +70,54 @@ def _make_inputs(args: argparse.Namespace, dtype: torch.dtype, device: torch.dev
         q = torch.randn(args.batch, args.seq_len, args.heads, args.head_dim, device=device, dtype=dtype)
         k = torch.randn(args.batch, args.seq_len, args.kv_heads, args.head_dim, device=device, dtype=dtype)
 
-    q_weight = torch.randn(args.head_dim, device=device, dtype=torch.float32)
-    k_weight = torch.randn(args.head_dim, device=device, dtype=torch.float32)
-    freqs = torch.randn(args.seq_len, args.head_dim // 2, device=device, dtype=torch.float32)
-    cos = torch.cos(freqs).to(dtype)
-    sin = torch.sin(freqs).to(dtype)
-    return q, k, q_weight, k_weight, cos, sin
+    q_weight = torch.randn(args.head_dim, device=device, dtype=dtype)
+    k_weight = torch.randn(args.head_dim, device=device, dtype=dtype)
+    angles = torch.randn(args.seq_len, args.head_dim // 2, device=device, dtype=torch.float32)
+    freqs = torch.polar(torch.ones_like(angles), angles)
+    return q, k, q_weight, k_weight, freqs
 
 
-def _eager(
+def _native(
     q: torch.Tensor,
     k: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
+    freqs: torch.Tensor,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     q = F.rms_norm(q, (q.shape[-1],), q_weight, eps)
     k = F.rms_norm(k, (k.shape[-1],), k_weight, eps)
     return (
-        apply_rotary_emb_torch(q, cos, sin, interleaved=True),
-        apply_rotary_emb_torch(k, cos, sin, interleaved=True),
+        _apply_qwen_image_rotary_emb(q, freqs),
+        _apply_qwen_image_rotary_emb(k, freqs),
     )
 
 
-def _existing_rope(
+def _fused(
     q: torch.Tensor,
     k: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
+    freqs: torch.Tensor,
     eps: float,
-    rope: RotaryEmbedding,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    q = F.rms_norm(q, (q.shape[-1],), q_weight, eps)
-    k = F.rms_norm(k, (k.shape[-1],), k_weight, eps)
-    return rope(q, cos, sin), rope(k, cos, sin)
+    batch, seq_len, num_heads, head_dim = q.shape
+    num_kv_heads = k.shape[2]
+    rope_table = torch.cat((freqs.real, freqs.imag), dim=-1)
+    rope_table = rope_table.unsqueeze(0).expand(batch, -1, -1).reshape(batch * seq_len, head_dim)
+    out_q, out_k = fused_qk_norm_rope(
+        q.reshape(batch * seq_len, num_heads, head_dim),
+        k.reshape(batch * seq_len, num_kv_heads, head_dim),
+        q_weight,
+        k_weight,
+        rope_table,
+        eps,
+        interleaved=True,
+    )
+    return (
+        out_q.reshape(batch, seq_len, num_heads, head_dim),
+        out_k.reshape(batch, seq_len, num_kv_heads, head_dim),
+    )
 
 
 def _measure(fn: Callable[[], tuple[torch.Tensor, torch.Tensor]], warmup: int, iters: int) -> list[float]:
@@ -176,17 +161,13 @@ def main() -> None:
     device = torch.device("cuda")
     dtype = _dtype(args.dtype)
     eps = 1e-6
-    q, k, q_weight, k_weight, cos, sin = _make_inputs(args, dtype, device)
-    rope = RotaryEmbedding(is_neox_style=False)
+    q, k, q_weight, k_weight, freqs = _make_inputs(args, dtype, device)
 
-    def eager():
-        return _eager(q, k, q_weight, k_weight, cos, sin, eps)
+    def native():
+        return _native(q, k, q_weight, k_weight, freqs, eps)
 
     def fused():
-        return fused_qk_norm_rope_interleaved(q, k, q_weight, k_weight, cos, sin, eps)
-
-    def existing_rope():
-        return _existing_rope(q, k, q_weight, k_weight, cos, sin, eps, rope)
+        return _fused(q, k, q_weight, k_weight, freqs, eps)
 
     results: dict[str, object] = {
         "device": torch.cuda.get_device_name(),
@@ -197,82 +178,41 @@ def main() -> None:
         "head_dim": args.head_dim,
         "dtype": args.dtype,
         "packed_qkv_view": args.packed_qkv_view,
-        "fused_fast_path_supported": fused_qk_norm_rope_interleaved_supported(q, k, cos, sin),
+        "fused_fast_path_supported": _fused_cuda_supported(
+            q.reshape(args.batch * args.seq_len, args.heads, args.head_dim),
+            k.reshape(args.batch * args.seq_len, args.kv_heads, args.head_dim),
+            args.head_dim,
+            args.head_dim,
+            interleaved=True,
+        ),
     }
 
-    eager_samples = _measure(eager, args.warmup, args.iters)
+    native_samples = _measure(native, args.warmup, args.iters)
     fused_samples = _measure(fused, args.warmup, args.iters)
-    existing_rope_samples = _measure(existing_rope, args.warmup, args.iters)
-    ref_q, ref_k = eager()
-    out_q, out_k = fused()
+    expected_q, expected_k = native()
+    actual_q, actual_k = fused()
     torch.accelerator.synchronize()
 
-    eager_stats = _stats(eager_samples)
+    native_stats = _stats(native_samples)
     fused_stats = _stats(fused_samples)
-    existing_rope_stats = _stats(existing_rope_samples)
-    results["eager"] = eager_stats
+    results["native"] = native_stats
     results["fused"] = fused_stats
-    results["existing_rope"] = existing_rope_stats
-    results["speedup_vs_eager"] = eager_stats["median_ms"] / fused_stats["median_ms"]
-    results["speedup_vs_existing_rope"] = existing_rope_stats["median_ms"] / fused_stats["median_ms"]
-    results["max_abs_q"] = (out_q.float() - ref_q.float()).abs().max().item()
-    results["max_abs_k"] = (out_k.float() - ref_k.float()).abs().max().item()
-    results["mean_abs_q"] = (out_q.float() - ref_q.float()).abs().mean().item()
-    results["mean_abs_k"] = (out_k.float() - ref_k.float()).abs().mean().item()
+    results["speedup_vs_native"] = native_stats["median_ms"] / fused_stats["median_ms"]
+    results["max_abs_q"] = (actual_q.float() - expected_q.float()).abs().max().item()
+    results["max_abs_k"] = (actual_k.float() - expected_k.float()).abs().max().item()
+    results["mean_abs_q"] = (actual_q.float() - expected_q.float()).abs().mean().item()
+    results["mean_abs_k"] = (actual_k.float() - expected_k.float()).abs().mean().item()
 
     if args.include_compiled:
-        compiled_eager = torch.compile(eager, dynamic=True, fullgraph=True)
+        compiled_native = torch.compile(native, dynamic=True, fullgraph=True)
         compiled_fused = torch.compile(fused, dynamic=True, fullgraph=True)
-        compiled_existing_rope = torch.compile(existing_rope, dynamic=True, fullgraph=True)
-        compiled_samples = _measure(compiled_eager, args.warmup, args.iters)
-        compiled_fused_samples = _measure(compiled_fused, args.warmup, args.iters)
-        compiled_existing_rope_samples = _measure(compiled_existing_rope, args.warmup, args.iters)
-        compiled_stats = _stats(compiled_samples)
-        compiled_fused_stats = _stats(compiled_fused_samples)
-        compiled_existing_rope_stats = _stats(compiled_existing_rope_samples)
-        results["compiled_eager"] = compiled_stats
+        compiled_native_stats = _stats(_measure(compiled_native, args.warmup, args.iters))
+        compiled_fused_stats = _stats(_measure(compiled_fused, args.warmup, args.iters))
+        results["compiled_native"] = compiled_native_stats
         results["compiled_fused"] = compiled_fused_stats
-        results["compiled_existing_rope"] = compiled_existing_rope_stats
-        results["compiled_fused_speedup_vs_compiled_eager"] = (
-            compiled_stats["median_ms"] / compiled_fused_stats["median_ms"]
+        results["compiled_fused_speedup_vs_compiled_native"] = (
+            compiled_native_stats["median_ms"] / compiled_fused_stats["median_ms"]
         )
-        results["compiled_fused_speedup_vs_compiled_existing_rope"] = (
-            compiled_existing_rope_stats["median_ms"] / compiled_fused_stats["median_ms"]
-        )
-
-    if args.launch_config_sweep:
-        launch_results: dict[str, dict[str, float]] = {}
-        for num_warps, num_stages in _parse_launch_configs(args.launch_configs):
-            name = f"warps{num_warps}_stages{num_stages}"
-
-            def fused_with_launch_config(
-                num_warps: int = num_warps,
-                num_stages: int = num_stages,
-            ):
-                return _launch_fused_qk_norm_rope_interleaved(
-                    q,
-                    k,
-                    q_weight,
-                    k_weight,
-                    cos,
-                    sin,
-                    eps,
-                    num_warps=num_warps,
-                    num_stages=num_stages,
-                )
-
-            samples = _measure(fused_with_launch_config, args.warmup, args.iters)
-            stats = _stats(samples)
-            stats["speedup_vs_eager"] = eager_stats["median_ms"] / stats["median_ms"]
-            stats["speedup_vs_existing_rope"] = existing_rope_stats["median_ms"] / stats["median_ms"]
-            launch_results[name] = stats
-
-        best_name, best_stats = min(launch_results.items(), key=lambda item: item[1]["median_ms"])
-        results["launch_config_sweep"] = launch_results
-        results["launch_config_best_by_median"] = {
-            "name": best_name,
-            **best_stats,
-        }
 
     print(json.dumps(results, indent=2))
     if args.profile:

@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 import torch
 import torch.nn.functional as F
 from vllm.triton_utils import HAS_TRITON
-
-from vllm_omni.diffusion.layers.rope import apply_rotary_emb_torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cuda, pytest.mark.diffusion]
 
@@ -84,97 +82,94 @@ def test_fused_qk_norm_rope_matches_bf16_reference(seq_len):
     torch.testing.assert_close(actual_k, expected_k, atol=0.0625, rtol=0.02)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
-@pytest.mark.parametrize("batched", [False, True])
-def test_fused_qk_norm_rope_interleaved_supports_shared_layouts(batched):
-    from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
-        fused_qk_norm_rope_interleaved,
-        fused_qk_norm_rope_interleaved_supported,
-    )
+# ---------------------------------------------------------------------------
+# General geometry (any even head_dim, here Boogu-Image's 120) in both
+# pairing modes, against the module's own eager reference at the same
+# tolerance as the MiniMax-H3 test above.
+# ---------------------------------------------------------------------------
 
-    torch.manual_seed(23)
-    batch = 2
-    seq_len = 17
-    q_heads = 7
-    k_heads = 3
-    head_dim = 64
-    rotary_dim = head_dim
-    shape_prefix = (batch, seq_len) if batched else (seq_len,)
-    q = torch.randn(*shape_prefix, q_heads, head_dim, device="cuda", dtype=torch.float16)
-    k = torch.randn(*shape_prefix, k_heads, head_dim, device="cuda", dtype=torch.float16)
-    q_weight = torch.randn(head_dim, device="cuda")
-    k_weight = torch.randn(head_dim, device="cuda")
-    freqs = torch.randn(seq_len, rotary_dim // 2, device="cuda")
-    cos = torch.cos(freqs).to(q.dtype)
-    sin = torch.sin(freqs).to(q.dtype)
+_BOOGU_HEAD_DIM = 120
 
-    expected_q = apply_rotary_emb_torch(
-        F.rms_norm(q, (head_dim,), q_weight, _EPS),
-        cos,
-        sin,
-        interleaved=True,
-    )
-    expected_k = apply_rotary_emb_torch(
-        F.rms_norm(k, (head_dim,), k_weight, _EPS),
-        cos,
-        sin,
-        interleaved=True,
-    )
 
-    assert fused_qk_norm_rope_interleaved_supported(q, k, cos, sin)
-    actual_q, actual_k = fused_qk_norm_rope_interleaved(q, k, q_weight, k_weight, cos, sin, _EPS)
-
-    torch.testing.assert_close(actual_q, expected_q, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(actual_k, expected_k, atol=1e-2, rtol=1e-2)
+def _boogu_inputs(strided: bool):
+    torch.manual_seed(11)
+    if strided:
+        # Slices of a wider head axis: the op must honour q/k strides
+        # (merged-QKV projections hand the op such views).
+        q = torch.randn(4139, 35, _BOOGU_HEAD_DIM, device="cuda", dtype=torch.bfloat16)[:, :28]
+        k = torch.randn(4139, 35, _BOOGU_HEAD_DIM, device="cuda", dtype=torch.bfloat16)[:, :7]
+    else:
+        q = torch.randn(4139, 28, _BOOGU_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(4139, 7, _BOOGU_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    q_weight = torch.randn(_BOOGU_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    k_weight = torch.randn(_BOOGU_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    freqs = torch.randn(4139, _BOOGU_HEAD_DIM // 2, device="cuda", dtype=torch.float32)
+    rope_table = torch.cat((torch.cos(freqs), torch.sin(freqs)), dim=-1)
+    return q, k, q_weight, k_weight, rope_table
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
-def test_fused_qk_norm_rope_interleaved_supports_boogu_geometry():
+@pytest.mark.parametrize("strided", [False, True])
+def test_fused_qk_norm_rope_interleaved(strided):
     from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
-        fused_qk_norm_rope_interleaved,
-        fused_qk_norm_rope_interleaved_supported,
+        _eager_qk_norm_rope,
+        _launch_fused_qk_norm_rope,
+        fused_qk_norm_rope,
     )
 
-    torch.manual_seed(29)
-    seq_len = 4139
-    q_heads = 28
-    k_heads = 7
-    head_dim = 120
-    qkv = torch.randn(
-        seq_len,
-        (q_heads + 2 * k_heads) * head_dim,
-        device="cuda",
-        dtype=torch.bfloat16,
+    q, k, q_weight, k_weight, rope_table = _boogu_inputs(strided)
+    expected = _eager_qk_norm_rope(q, k, q_weight, k_weight, rope_table, _EPS, _BOOGU_HEAD_DIM, _BOOGU_HEAD_DIM, True)
+    # Check the public op AND the launcher directly: the latter cannot fall
+    # back to eager, so a silent dispatch regression cannot go green here.
+    for actual in (
+        fused_qk_norm_rope(q, k, q_weight, k_weight, rope_table, _EPS, interleaved=True),
+        _launch_fused_qk_norm_rope(q, k, q_weight, k_weight, rope_table, _EPS, interleaved=True),
+    ):
+        torch.testing.assert_close(actual[0], expected[0], atol=0.0625, rtol=0.02)
+        torch.testing.assert_close(actual[1], expected[1], atol=0.0625, rtol=0.02)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+def test_fused_qk_norm_rope_half_split_general_dim():
+    """head_dim=120 off the MiniMax-H3 128 pin, half-split pairing.
+
+    Exercises the generalised combined kernel's half-split mode via the
+    launcher. It is not routed in production (half-split traffic keeps the
+    untouched pre-existing per-tensor kernel and its 128/96 contract, so the
+    public op falls back to eager at this geometry), pending the
+    maintainers' call.
+    """
+    from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+        _eager_qk_norm_rope,
+        _launch_fused_qk_norm_rope,
     )
-    q, k, _ = qkv.split(
-        (q_heads * head_dim, k_heads * head_dim, k_heads * head_dim),
-        dim=-1,
-    )
-    q = q.unflatten(-1, (q_heads, head_dim))
-    k = k.unflatten(-1, (k_heads, head_dim))
-    q_weight = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
-    k_weight = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
-    freqs = torch.randn(seq_len, head_dim // 2, device="cuda")
-    cos = torch.cos(freqs)
-    sin = torch.sin(freqs)
 
-    expected_q = apply_rotary_emb_torch(
-        F.rms_norm(q, (head_dim,), q_weight, _EPS),
-        cos,
-        sin,
-        interleaved=True,
-    ).to(q.dtype)
-    expected_k = apply_rotary_emb_torch(
-        F.rms_norm(k, (head_dim,), k_weight, _EPS),
-        cos,
-        sin,
-        interleaved=True,
-    ).to(k.dtype)
+    q, k, q_weight, k_weight, rope_table = _boogu_inputs(strided=False)
+    expected = _eager_qk_norm_rope(q, k, q_weight, k_weight, rope_table, _EPS, _BOOGU_HEAD_DIM, _BOOGU_HEAD_DIM)
+    actual = _launch_fused_qk_norm_rope(q, k, q_weight, k_weight, rope_table, _EPS, interleaved=False)
+    torch.testing.assert_close(actual[0], expected[0], atol=0.0625, rtol=0.02)
+    torch.testing.assert_close(actual[1], expected[1], atol=0.0625, rtol=0.02)
 
-    assert fused_qk_norm_rope_interleaved_supported(q, k, cos, sin)
-    actual_q, actual_k = fused_qk_norm_rope_interleaved(q, k, q_weight, k_weight, cos, sin, _EPS)
 
-    torch.testing.assert_close(actual_q, expected_q, atol=0.0625, rtol=0.02)
-    torch.testing.assert_close(actual_k, expected_k, atol=0.0625, rtol=0.02)
+def test_fused_qk_norm_rope_min_tokens_resolution(monkeypatch):
+    """The op-level token-gate override: unset or blank -> caller's default; a
+    non-negative integer string overrides it (``0`` = always fuse); anything
+    else is rejected naming the variable."""
+    from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope_min_tokens
+
+    env = "VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS"
+    monkeypatch.delenv(env, raising=False)
+    assert fused_qk_norm_rope_min_tokens(2048) == 2048
+    for blank in ("", "  "):
+        monkeypatch.setenv(env, blank)
+        assert fused_qk_norm_rope_min_tokens(2048) == 2048
+    monkeypatch.setenv(env, "0")
+    assert fused_qk_norm_rope_min_tokens(2048) == 0
+    monkeypatch.setenv(env, "4096")
+    assert fused_qk_norm_rope_min_tokens(2048) == 4096
+    for bad in ("-1", "abc"):
+        monkeypatch.setenv(env, bad)
+        with pytest.raises(ValueError, match=env):
+            fused_qk_norm_rope_min_tokens(2048)
