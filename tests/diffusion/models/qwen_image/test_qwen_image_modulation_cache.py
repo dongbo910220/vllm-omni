@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import nullcontext
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -12,6 +11,8 @@ from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 from vllm_omni.diffusion.models.qwen_image.cfg_parallel import QwenImageCFGParallelMixin
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImagePipeline
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import QwenImageTransformerBlock
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _CountingProjection(nn.Module):
@@ -221,10 +222,19 @@ class _Progress:
         pass
 
 
+class _Scheduler:
+    def set_begin_index(self, _index: int) -> None:
+        pass
+
+
+class _Transformer:
+    do_true_cfg = False
+
+
 class _DummyCFG(QwenImageCFGParallelMixin):
     def __init__(self):
-        self.scheduler = SimpleNamespace(set_begin_index=lambda _: None)
-        self.transformer = SimpleNamespace(do_true_cfg=False)
+        self.scheduler = _Scheduler()
+        self.transformer = _Transformer()
         self.interrupt = False
         self.seen = None
 
@@ -258,6 +268,7 @@ def test_streaming_diffuse_shares_model_timestep_across_cfg_branches() -> None:
         true_cfg_scale=4.0,
     )
 
+    assert pipeline.seen is not None
     positive_kwargs, negative_kwargs = pipeline.seen
     assert negative_kwargs is not None
     assert positive_kwargs["timestep"] is negative_kwargs["timestep"]
