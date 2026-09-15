@@ -223,8 +223,8 @@ def _validate_select01_inputs(
 ) -> None:
     if x.dim() != 3:
         raise ValueError("x must be 3D [B, L, C]")
-    if index.dim() != 2 or index.shape != x.shape[:2]:
-        raise ValueError("index must be 2D [B, L] and match x batch/sequence")
+    if index.dim() != 2 or index.shape[1] != x.shape[1] or index.shape[0] not in (1, x.shape[0]):
+        raise ValueError("index must be 2D [B or 1, L] and match x batch/sequence")
     batch_size, _, hidden_size = x.shape
     for tensor in tensors:
         if tensor.dim() != 2 or tensor.shape != (batch_size, hidden_size):
@@ -302,7 +302,7 @@ def _launch_layernorm_select01(
         shift1.stride(1),
         gate1.stride(0),
         gate1.stride(1),
-        index.stride(0),
+        index.stride(0) if index.shape[0] > 1 else 0,
         index.stride(1),
         eps,
         has_weight=weight is not None,
@@ -398,7 +398,7 @@ def _launch_residual_layernorm_select01(
         shift1.stride(1),
         gate1.stride(0),
         gate1.stride(1),
-        index.stride(0),
+        index.stride(0) if index.shape[0] > 1 else 0,
         index.stride(1),
         eps,
         has_weight=weight is not None,

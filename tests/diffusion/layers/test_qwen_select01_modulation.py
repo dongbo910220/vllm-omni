@@ -93,9 +93,12 @@ def _reference_residual_layernorm_select01(
 
 @pytest.mark.cpu
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_qwen_select01_native_fallback_matches_reference(dtype: torch.dtype):
+@pytest.mark.parametrize("broadcast_index", [False, True])
+def test_qwen_select01_native_fallback_matches_reference(dtype: torch.dtype, broadcast_index: bool):
     device = torch.device("cpu")
     x, residual, residual_gate, mod_params, index = _make_inputs(2, 17, 64, dtype, device)
+    if broadcast_index:
+        index = index[:1]
     eps = 1e-6
 
     actual_norm, actual_gate = fused_layernorm_select01(x, mod_params, index, eps)
@@ -188,6 +191,46 @@ def test_qwen_select01_triton_matches_reference_for_structured_multi_batch_index
         dtype=torch.int64,
         device=device,
     )
+    eps = 1e-6
+
+    actual_norm, actual_gate = fused_layernorm_select01(x, mod_params, index, eps)
+    ref_norm, ref_gate = _reference_layernorm_select01(x, mod_params, index, eps)
+    torch.testing.assert_close(actual_norm, ref_norm, atol=atol, rtol=rtol)
+    torch.testing.assert_close(actual_gate, ref_gate, atol=0, rtol=0)
+
+    actual_norm, actual_residual, actual_gate = fused_residual_layernorm_select01(
+        x,
+        residual,
+        residual_gate.expand_as(residual),
+        mod_params,
+        index,
+        eps,
+    )
+    ref_norm, ref_residual, ref_gate = _reference_residual_layernorm_select01(
+        x,
+        residual,
+        residual_gate.expand_as(residual),
+        mod_params,
+        index,
+        eps,
+    )
+    torch.testing.assert_close(actual_norm, ref_norm, atol=atol, rtol=rtol)
+    torch.testing.assert_close(actual_residual, ref_residual, atol=atol, rtol=rtol)
+    torch.testing.assert_close(actual_gate, ref_gate, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    ("dtype", "atol", "rtol"),
+    [
+        (torch.float32, 1e-5, 1e-5),
+        (torch.bfloat16, 5e-2, 5e-2),
+    ],
+)
+def test_qwen_select01_triton_broadcasts_single_index_batch(dtype: torch.dtype, atol: float, rtol: float):
+    device = torch.device("cuda:0")
+    x, residual, residual_gate, mod_params, index = _make_inputs(2, 17, 256, dtype, device)
+    index = index[:1]
     eps = 1e-6
 
     actual_norm, actual_gate = fused_layernorm_select01(x, mod_params, index, eps)
