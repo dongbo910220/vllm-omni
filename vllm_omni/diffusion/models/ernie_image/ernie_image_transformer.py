@@ -115,7 +115,6 @@ def _apply_qk_rotary_emb(
         key,
         freqs_cos,
         freqs_sin,
-        _apply_rotary_emb,
     )
     if fused is not None:
         return fused

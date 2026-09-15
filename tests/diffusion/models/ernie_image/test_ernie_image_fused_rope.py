@@ -18,10 +18,8 @@ def reset_fused_rope_state():
     from vllm_omni.diffusion.models.ernie_image import fused_rope
 
     fused_rope._FAILED_KEYS.clear()
-    fused_rope._VERIFIED_KEYS.clear()
     yield
     fused_rope._FAILED_KEYS.clear()
-    fused_rope._VERIFIED_KEYS.clear()
 
 
 def _inputs(shape: tuple[int, int, int, int]):
@@ -51,8 +49,6 @@ def _inputs(shape: tuple[int, int, int, int]):
     ],
 )
 def test_fused_qk_rope_is_bit_exact(shape):
-    from vllm_omni.diffusion.models.ernie_image import fused_rope
-
     query, key, freqs_cos, freqs_sin = _inputs(shape)
     with torch.inference_mode():
         expected_query = _apply_rotary_emb(query, freqs_cos, freqs_sin)
@@ -61,56 +57,42 @@ def test_fused_qk_rope_is_bit_exact(shape):
 
     assert torch.equal(actual_query, expected_query)
     assert torch.equal(actual_key, expected_key)
-    assert len(fused_rope._VERIFIED_KEYS) == 1
-    assert not fused_rope._FAILED_KEYS
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
-def test_verified_key_does_not_repeat_eager_check():
-    from vllm_omni.diffusion.models.ernie_image import fused_rope
-
-    query, key, freqs_cos, freqs_sin = _inputs((2, 257, 8, 128))
-    with torch.inference_mode():
-        first = fused_rope.try_fused_qk_rotary_emb(query, key, freqs_cos, freqs_sin, _apply_rotary_emb)
-        assert first is not None
-
-        def unexpected_eager_call(*args):
-            raise AssertionError("verified geometry must not rerun eager verification")
-
-        second = fused_rope.try_fused_qk_rotary_emb(query, key, freqs_cos, freqs_sin, unexpected_eager_call)
-    assert second is not None
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
-def test_mismatch_disables_runtime_key(monkeypatch):
+def test_launch_failure_disables_runtime_key(monkeypatch):
     from vllm_omni.diffusion.models.ernie_image import fused_rope
 
     query, key, freqs_cos, freqs_sin = _inputs((1, 17, 3, 128))
+    launch_count = 0
+
+    def failing_launch(*args):
+        nonlocal launch_count
+        launch_count += 1
+        raise RuntimeError("injected launch failure")
+
     monkeypatch.setattr(
         fused_rope,
         "_launch_fused_qk_rotary_emb",
-        lambda *args: (torch.zeros_like(query), torch.zeros_like(key)),
+        failing_launch,
     )
     with torch.inference_mode():
-        first = fused_rope.try_fused_qk_rotary_emb(query, key, freqs_cos, freqs_sin, _apply_rotary_emb)
-    assert first is not None
-    assert torch.equal(first[0], _apply_rotary_emb(query, freqs_cos, freqs_sin))
-    assert torch.equal(first[1], _apply_rotary_emb(key, freqs_cos, freqs_sin))
+        for _ in range(2):
+            assert fused_rope.try_fused_qk_rotary_emb(query, key, freqs_cos, freqs_sin) is None
+    assert launch_count == 1
     assert len(fused_rope._FAILED_KEYS) == 1
 
-    def unexpected_launch(*args):
-        raise AssertionError("failed geometry must not launch again")
 
-    monkeypatch.setattr(
-        fused_rope,
-        "_launch_fused_qk_rotary_emb",
-        unexpected_launch,
-    )
-    with torch.inference_mode():
-        second = fused_rope.try_fused_qk_rotary_emb(query, key, freqs_cos, freqs_sin, _apply_rotary_emb)
-    assert second is None
+def test_failed_runtime_key_cache_is_bounded():
+    from vllm_omni.diffusion.models.ernie_image import fused_rope
+
+    for index in range(fused_rope._FAILED_KEYS_MAX_SIZE + 1):
+        fused_rope._record_failed_runtime_key((index,))
+
+    assert len(fused_rope._FAILED_KEYS) == fused_rope._FAILED_KEYS_MAX_SIZE
+    assert (0,) not in fused_rope._FAILED_KEYS
+    assert (fused_rope._FAILED_KEYS_MAX_SIZE,) in fused_rope._FAILED_KEYS
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -130,7 +112,7 @@ def test_compile_path_does_not_launch_fused_kernel(monkeypatch):
         unexpected_launch,
     )
     with torch.inference_mode():
-        assert fused_rope.try_fused_qk_rotary_emb(query, key, freqs_cos, freqs_sin, _apply_rotary_emb) is None
+        assert fused_rope.try_fused_qk_rotary_emb(query, key, freqs_cos, freqs_sin) is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -154,7 +136,6 @@ def test_gradient_inputs_do_not_launch_fused_kernel(monkeypatch, requires_grad_i
     assert (
         fused_rope.try_fused_qk_rotary_emb(
             *values,
-            _apply_rotary_emb,
         )
         is None
     )
@@ -182,7 +163,6 @@ def test_mismatched_key_dtype_or_device_does_not_launch(monkeypatch):
                 unsupported_key,
                 freqs_cos,
                 freqs_sin,
-                _apply_rotary_emb,
             )
             is None
         )

@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections import OrderedDict
 
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, triton
@@ -15,8 +15,8 @@ from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 
-_FAILED_KEYS: set[tuple[object, ...]] = set()
-_VERIFIED_KEYS: set[tuple[object, ...]] = set()
+_FAILED_KEYS_MAX_SIZE = 128
+_FAILED_KEYS: OrderedDict[tuple[object, ...], None] = OrderedDict()
 
 
 if HAS_TRITON:
@@ -104,6 +104,20 @@ def _runtime_key(
     )
 
 
+def _is_failed_runtime_key(runtime_key: tuple[object, ...]) -> bool:
+    if runtime_key not in _FAILED_KEYS:
+        return False
+    _FAILED_KEYS.move_to_end(runtime_key)
+    return True
+
+
+def _record_failed_runtime_key(runtime_key: tuple[object, ...]) -> None:
+    _FAILED_KEYS[runtime_key] = None
+    _FAILED_KEYS.move_to_end(runtime_key)
+    while len(_FAILED_KEYS) > _FAILED_KEYS_MAX_SIZE:
+        _FAILED_KEYS.popitem(last=False)
+
+
 def _supported_inputs(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -176,42 +190,22 @@ def try_fused_qk_rotary_emb(
     key: torch.Tensor,
     freqs_cos: torch.Tensor,
     freqs_sin: torch.Tensor,
-    eager_fn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Return fused Q/K outputs, or ``None`` to request the eager fallback.
-
-    A new runtime geometry is admitted only after its first fused result is
-    exactly equal to the existing eager implementation. A failed key remains
-    disabled for the process lifetime.
-    """
+    """Return fused Q/K outputs, or ``None`` to request the eager fallback."""
 
     if not _supported_inputs(query, key, freqs_cos, freqs_sin):
         return None
 
     runtime_key = _runtime_key(query, key, freqs_cos)
-    if runtime_key in _FAILED_KEYS:
+    if _is_failed_runtime_key(runtime_key):
         return None
 
     try:
-        output_query, output_key = _launch_fused_qk_rotary_emb(query, key, freqs_cos, freqs_sin)
+        return _launch_fused_qk_rotary_emb(query, key, freqs_cos, freqs_sin)
     except Exception:
-        _FAILED_KEYS.add(runtime_key)
+        _record_failed_runtime_key(runtime_key)
         logger.exception("ERNIE-Image fused Q/K RoPE failed; using the eager fallback")
         return None
-
-    if runtime_key in _VERIFIED_KEYS:
-        return output_query, output_key
-
-    eager_query = eager_fn(query, freqs_cos, freqs_sin)
-    eager_key = eager_fn(key, freqs_cos, freqs_sin)
-    if torch.equal(output_query, eager_query) and torch.equal(output_key, eager_key):
-        _VERIFIED_KEYS.add(runtime_key)
-        logger.info("ERNIE-Image fused Q/K RoPE passed bit-exact verification")
-        return output_query, output_key
-
-    _FAILED_KEYS.add(runtime_key)
-    logger.warning("ERNIE-Image fused Q/K RoPE was not bit-exact; using the eager fallback")
-    return eager_query, eager_key
 
 
 __all__ = ["try_fused_qk_rotary_emb"]
