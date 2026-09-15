@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from collections import OrderedDict
 from collections.abc import Iterable
 from typing import Any
 
@@ -41,8 +42,8 @@ RotaryEmbedding = tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.
 # hardware-specific crossover without adding another environment variable.
 _FUSED_MIN_TOKENS = 512
 _FUSED_QK_ROPE = HAS_TRITON and current_platform.is_cuda()
-_VERIFIED_QK_ROPE_SIGNATURES: set[tuple] = set()
-_FAILED_QK_ROPE_SIGNATURES: set[tuple] = set()
+_FAILED_QK_ROPE_SIGNATURES_MAX_SIZE = 128
+_FAILED_QK_ROPE_SIGNATURES: OrderedDict[tuple[object, ...], None] = OrderedDict()
 
 
 def _fusion_enabled(sequence_parallel_size: int | None, *, enforce_eager: bool) -> bool:
@@ -87,8 +88,8 @@ def _qk_rope_signature(
     key: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-) -> tuple:
-    """Identify every layout whose full output needs one exactness check."""
+) -> tuple[object, ...]:
+    """Identify a runtime layout for failure-cache fallback."""
 
     return (
         query.device.type,
@@ -103,6 +104,20 @@ def _qk_rope_signature(
         tuple(cos.stride()),
         tuple(sin.stride()),
     )
+
+
+def _is_failed_qk_rope_signature(signature: tuple[object, ...]) -> bool:
+    if signature not in _FAILED_QK_ROPE_SIGNATURES:
+        return False
+    _FAILED_QK_ROPE_SIGNATURES.move_to_end(signature)
+    return True
+
+
+def _record_failed_qk_rope_signature(signature: tuple[object, ...]) -> None:
+    _FAILED_QK_ROPE_SIGNATURES[signature] = None
+    _FAILED_QK_ROPE_SIGNATURES.move_to_end(signature)
+    while len(_FAILED_QK_ROPE_SIGNATURES) > _FAILED_QK_ROPE_SIGNATURES_MAX_SIZE:
+        _FAILED_QK_ROPE_SIGNATURES.popitem(last=False)
 
 
 def _can_use_fused_qk_rope(
@@ -134,7 +149,7 @@ def _apply_qk_rope(
     sequence_parallel_size: int | None,
     min_tokens: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply one paired RoPE launch, self-verifying each runtime signature."""
+    """Apply one paired RoPE launch, falling back after launch failures."""
 
     if rotary_emb is None:
         return query, key
@@ -144,34 +159,19 @@ def _apply_qk_rope(
         return _apply_qk_rope_reference(query, key, rotary_pair)
 
     signature = _qk_rope_signature(query, key, cos, sin)
-    if signature in _FAILED_QK_ROPE_SIGNATURES:
+    if _is_failed_qk_rope_signature(signature):
         return _apply_qk_rope_reference(query, key, rotary_pair)
 
     try:
-        output = fused_qk_rope(query, key, cos, sin)
+        return fused_qk_rope(query, key, cos, sin)
     except Exception as exc:  # noqa: BLE001 - optimized-path failures must fall back
-        _FAILED_QK_ROPE_SIGNATURES.add(signature)
+        _record_failed_qk_rope_signature(signature)
         logger.warning(
             "Disabling LongCat paired Q/K RoPE fusion for signature %s after failure: %s",
             signature,
             exc,
         )
         return _apply_qk_rope_reference(query, key, rotary_pair)
-
-    if signature in _VERIFIED_QK_ROPE_SIGNATURES:
-        return output
-
-    reference = _apply_qk_rope_reference(query, key, rotary_pair)
-    if torch.equal(output[0], reference[0]) and torch.equal(output[1], reference[1]):
-        _VERIFIED_QK_ROPE_SIGNATURES.add(signature)
-        return output
-
-    _FAILED_QK_ROPE_SIGNATURES.add(signature)
-    logger.warning(
-        "Disabling LongCat paired Q/K RoPE fusion for signature %s after a bit-exactness mismatch",
-        signature,
-    )
-    return reference
 
 
 class FeedForward(nn.Module):

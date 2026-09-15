@@ -15,10 +15,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 def _clear_qk_rope_signature_caches():
     from vllm_omni.diffusion.models.longcat_image import longcat_image_transformer as longcat
 
-    longcat._VERIFIED_QK_ROPE_SIGNATURES.clear()
     longcat._FAILED_QK_ROPE_SIGNATURES.clear()
     yield
-    longcat._VERIFIED_QK_ROPE_SIGNATURES.clear()
     longcat._FAILED_QK_ROPE_SIGNATURES.clear()
 
 
@@ -96,49 +94,37 @@ def test_qk_rope_non_eager_modes_use_exact_original_path(monkeypatch, mode, sp_s
     assert torch.equal(actual[1], expected[1])
 
 
-def test_qk_rope_verifies_full_output_once_per_signature(monkeypatch):
+def test_qk_rope_eligible_path_skips_runtime_parity_check(monkeypatch):
     from vllm_omni.diffusion.models.longcat_image import longcat_image_transformer as longcat
 
     torch.manual_seed(2)
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(longcat, "fused_qk_rope_supported", lambda *args: True)
-
-    raw_reference = longcat._apply_qk_rope_reference
-    reference_calls = 0
     fused_calls = 0
 
-    def tracked_reference(*args):
-        nonlocal reference_calls
-        reference_calls += 1
-        return raw_reference(*args)
-
-    def exact_fused(query, key, cos, sin):
+    def fused(query, key, cos, sin):
         nonlocal fused_calls
         fused_calls += 1
-        return raw_reference(query, key, (cos, sin))
+        return query + 1, key + 2
 
-    monkeypatch.setattr(longcat, "_apply_qk_rope_reference", tracked_reference)
-    monkeypatch.setattr(longcat, "fused_qk_rope", exact_fused)
+    monkeypatch.setattr(
+        longcat,
+        "_apply_qk_rope_reference",
+        lambda *args: (_ for _ in ()).throw(AssertionError("eligible path ran the native parity check")),
+    )
+    monkeypatch.setattr(longcat, "fused_qk_rope", fused)
 
     with torch.no_grad():
-        q, k, rotary_emb = _inputs(sequence=5)
-        first = longcat._apply_qk_rope(q, k, rotary_emb, 1, 0)
-        second = longcat._apply_qk_rope(q.clone(), k.clone(), rotary_emb, 1, 0)
-        q_other, k_other, rotary_other = _inputs(sequence=7)
-        third = longcat._apply_qk_rope(q_other, k_other, rotary_other, 1, 0)
+        q, k, rotary_emb = _inputs()
+        actual = longcat._apply_qk_rope(q, k, rotary_emb, 1, 0)
 
-    assert torch.equal(first[0], _reference(q, k, rotary_emb)[0])
-    assert torch.equal(second[1], _reference(q, k, rotary_emb)[1])
-    assert torch.equal(third[0], _reference(q_other, k_other, rotary_other)[0])
-    assert fused_calls == 3
-    assert reference_calls == 2
-    assert len(longcat._VERIFIED_QK_ROPE_SIGNATURES) == 2
-    assert not longcat._FAILED_QK_ROPE_SIGNATURES
+    assert fused_calls == 1
+    assert torch.equal(actual[0], q + 1)
+    assert torch.equal(actual[1], k + 2)
 
 
-@pytest.mark.parametrize("failure", ["mismatch", "exception"])
-def test_qk_rope_first_use_failure_permanently_falls_back(monkeypatch, failure):
+def test_qk_rope_launch_failure_permanently_falls_back(monkeypatch):
     from vllm_omni.diffusion.models.longcat_image import longcat_image_transformer as longcat
 
     torch.manual_seed(3)
@@ -150,9 +136,7 @@ def test_qk_rope_first_use_failure_permanently_falls_back(monkeypatch, failure):
     def broken_fused(query, key, cos, sin):
         nonlocal fused_calls
         fused_calls += 1
-        if failure == "exception":
-            raise RuntimeError("kernel failed")
-        return torch.zeros_like(query), torch.zeros_like(key)
+        raise RuntimeError("kernel failed")
 
     monkeypatch.setattr(longcat, "fused_qk_rope", broken_fused)
     q, k, rotary_emb = _inputs()
@@ -163,10 +147,20 @@ def test_qk_rope_first_use_failure_permanently_falls_back(monkeypatch, failure):
 
     assert fused_calls == 1
     assert len(longcat._FAILED_QK_ROPE_SIGNATURES) == 1
-    assert not longcat._VERIFIED_QK_ROPE_SIGNATURES
     for actual in (first, second):
         assert torch.equal(actual[0], expected[0])
         assert torch.equal(actual[1], expected[1])
+
+
+def test_failed_qk_rope_signature_cache_is_bounded():
+    from vllm_omni.diffusion.models.longcat_image import longcat_image_transformer as longcat
+
+    for index in range(longcat._FAILED_QK_ROPE_SIGNATURES_MAX_SIZE + 1):
+        longcat._record_failed_qk_rope_signature((index,))
+
+    assert len(longcat._FAILED_QK_ROPE_SIGNATURES) == longcat._FAILED_QK_ROPE_SIGNATURES_MAX_SIZE
+    assert (0,) not in longcat._FAILED_QK_ROPE_SIGNATURES
+    assert (longcat._FAILED_QK_ROPE_SIGNATURES_MAX_SIZE,) in longcat._FAILED_QK_ROPE_SIGNATURES
 
 
 class _FakeQKV(torch.nn.Module):
