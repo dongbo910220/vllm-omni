@@ -5,10 +5,7 @@ import pytest
 import torch
 from vllm.triton_utils import HAS_TRITON
 
-from vllm_omni.diffusion.models.ernie_image.ernie_image_transformer import (
-    _apply_qk_rotary_emb,
-    _apply_rotary_emb,
-)
+from vllm_omni.diffusion.models.ernie_image.ernie_image_transformer import _apply_rotary_emb
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cuda, pytest.mark.diffusion]
 
@@ -49,12 +46,16 @@ def _inputs(shape: tuple[int, int, int, int]):
     ],
 )
 def test_fused_qk_rope_is_bit_exact(shape):
+    from vllm_omni.diffusion.models.ernie_image import fused_rope
+
     query, key, freqs_cos, freqs_sin = _inputs(shape)
     with torch.inference_mode():
         expected_query = _apply_rotary_emb(query, freqs_cos, freqs_sin)
         expected_key = _apply_rotary_emb(key, freqs_cos, freqs_sin)
-        actual_query, actual_key = _apply_qk_rotary_emb(query, key, freqs_cos, freqs_sin)
+        actual = fused_rope.try_fused_qk_rotary_emb(query, key, freqs_cos, freqs_sin)
 
+    assert actual is not None
+    actual_query, actual_key = actual
     assert torch.equal(actual_query, expected_query)
     assert torch.equal(actual_key, expected_key)
 
