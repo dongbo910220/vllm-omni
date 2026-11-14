@@ -128,7 +128,7 @@ class DiTAttention(nn.Module):
 
     @torch.no_grad()
     def fuse_qkv_projections(self) -> None:
-        """Pack loaded inference weights without changing the checkpoint format."""
+        """Pack weights for inference, changing this instance's state_dict keys."""
         if self.training:
             raise ValueError("QKV packing requires inference mode")
         if self.to_qkv is not None:
@@ -140,6 +140,7 @@ class DiTAttention(nn.Module):
         )
         packed.bias = nn.Parameter(torch.cat([self.to_q.bias, self.to_k.bias, self.to_v.bias]), requires_grad=False)
         self.to_qkv = packed.eval()
+        del self.to_q, self.to_k, self.to_v
 
     def forward(
         self,

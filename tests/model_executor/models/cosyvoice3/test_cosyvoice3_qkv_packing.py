@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Projection packing contracts, independent of padding or audio equivalence."""
 
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -52,3 +53,32 @@ def test_pack_preserves_loaded_weights_projections_and_rng(dtype):
 def test_pack_rejects_training():
     with pytest.raises(ValueError, match="inference mode"):
         make_attention().fuse_qkv_projections()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@torch.inference_mode()
+def test_pack_releases_separate_projections_and_preserves_forward(dtype):
+    attention = make_attention().to(dtype=dtype).eval()
+    original_numel = sum(parameter.numel() for parameter in attention.parameters())
+    original_projections = [weakref.ref(getattr(attention, f"to_{part}")) for part in ("q", "k", "v")]
+    x = torch.randn(2, 5, 64, dtype=dtype)
+    expected = attention(x)
+
+    attention.fuse_qkv_projections()
+
+    assert sum(parameter.numel() for parameter in attention.parameters()) == original_numel
+    assert all(projection() is None for projection in original_projections)
+    tolerance = 1e-5 if dtype == torch.float32 else 2e-2
+    torch.testing.assert_close(attention(x), expected, rtol=tolerance, atol=tolerance)
+
+
+def test_original_checkpoint_reload_requires_fresh_instance():
+    attention = make_attention().eval()
+    checkpoint = attention.state_dict()
+    attention.fuse_qkv_projections()
+
+    with pytest.raises(RuntimeError, match="Missing key"):
+        attention.load_state_dict(checkpoint, strict=True)
+
+    restored = make_attention().eval()
+    restored.load_state_dict(checkpoint, strict=True)
